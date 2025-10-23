@@ -1,25 +1,62 @@
+# migrations/env.py
+from __future__ import annotations
 from logging.config import fileConfig
 from sqlalchemy import engine_from_config, pool
 from alembic import context
-from app.db import Base
-from app import models  # noqa: import models
-from app.config import settings
 
+import os
+import sys
+
+# дозволяємо імпортувати app.*
+sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
+
+from app.db import Base  # noqa: E402
+# ІМПОРТУЄМО МОДЕЛІ, щоб metadata була заповнена
+from app import models  # noqa: F401
+
+# Це конфіг Alembic
 config = context.config
-fileConfig(config.config_file_name)
 
-def run_migrations_offline():
-    url = settings.DATABASE_URL
-    context.configure(url=url, target_metadata=Base.metadata, literal_binds=True, dialect_opts={"paramstyle": "named"})
+# Підсовуємо наш DATABASE_URL у alembic.ini "sqlalchemy.url"
+db_url = os.getenv("DATABASE_URL")
+if not db_url:
+    raise RuntimeError("DATABASE_URL is not set")
+config.set_main_option("sqlalchemy.url", db_url)
+
+if config.config_file_name is not None:
+    fileConfig(config.config_file_name)
+
+target_metadata = Base.metadata
+
+
+def run_migrations_offline() -> None:
+    url = config.get_main_option("sqlalchemy.url")
+    context.configure(
+        url=url,
+        target_metadata=target_metadata,
+        literal_binds=True,
+        compare_type=True,
+    )
     with context.begin_transaction():
         context.run_migrations()
 
-def run_migrations_online():
-    connectable = engine_from_config({"sqlalchemy.url": settings.DATABASE_URL}, prefix="sqlalchemy.", poolclass=pool.NullPool)
+
+def run_migrations_online() -> None:
+    connectable = engine_from_config(
+        config.get_section(config.config_ini_section),
+        prefix="sqlalchemy.",
+        poolclass=pool.NullPool,
+        future=True,
+    )
     with connectable.connect() as connection:
-        context.configure(connection=connection, target_metadata=Base.metadata)
+        context.configure(
+            connection=connection,
+            target_metadata=target_metadata,
+            compare_type=True,
+        )
         with context.begin_transaction():
             context.run_migrations()
+
 
 if context.is_offline_mode():
     run_migrations_offline()
