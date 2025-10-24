@@ -50,69 +50,62 @@ class WithdrawSG(StatesGroup):
 async def start(message: Message, session: AsyncSession):
     tg_id = message.from_user.id
 
-    # deep link payload: "/start <payload>"
     payload = None
     if " " in message.text:
         payload = message.text.split(" ", 1)[1].strip()
 
+    # приймаємо payload формату: "<digits>" або "start=<digits>" або "ref=<digits>"
     referrer_id = None
-    if payload and payload.startswith("start="):
-        try:
-            referrer_id = int(payload.split("=", 1)[1])
-        except Exception:
-            referrer_id = None
+    if payload:
+        p = payload
+        if "=" in p:
+            _, p = p.split("=", 1)
+        if p.isdigit():
+            try:
+                referrer_id = int(p)
+            except:
+                referrer_id = None
 
-    # upsert user (referrer_id фіксуємо лише під час першого /start)
-    res = await session.execute(select(Users).where(Users.tg_id == tg_id))
-    user = res.scalar()
+    # upsert user (реферера пишемо тільки при першому старті)
+    user = (await session.execute(select(Users).where(Users.tg_id == tg_id))).scalar_one_or_none()
     if not user:
         user = Users(tg_id=tg_id, referrer_id=referrer_id)
         session.add(user)
         await session.flush()
 
-    # ask language once
+    # якщо нема мови — показуємо вибір мови
     if not user.lang:
         kb = InlineKeyboardMarkup(
             inline_keyboard=[
                 [InlineKeyboardButton(text="🇺🇦 УКР", callback_data="lang:uk")],
-                [InlineKeyboardButton(text="🇷🇺 РУ", callback_data="lang:ru")],
-                [InlineKeyboardButton(text="🇬🇧 EN", callback_data="lang:en")],
+                [InlineKeyboardButton(text="🇷🇺 РУ",  callback_data="lang:ru")],
+                [InlineKeyboardButton(text="🇬🇧 EN",  callback_data="lang:en")],
             ]
         )
         await message.answer(I18N["choose_lang"]["uk"], reply_markup=kb)
         return
 
-    # if inactive → create CryptoCloud invoice and show link
-    if str(user.status) in {"inactive", UserStatus.inactive}:
+    # якщо не активний — пропонуємо оплату
+    if str(user.status) in {"inactive", "inactive"}:
         try:
             inv = await create_invoice(settings.ENTRY_AMOUNT_USD, order_id=f"u{user.id}")
-            uuid = inv.get("result", {}).get("uuid")
-            link = inv.get("result", {}).get("link")
-        except Exception as e:
-            uuid = link = None
+            uuid = inv.get("result", {}).get("uuid"); link = inv.get("result", {}).get("link")
+        except: uuid=link=None
         if uuid and link:
-            session.add(
-                Payments(
-                    user_id=user.id,
-                    uuid=uuid,
-                    amount_usd=settings.ENTRY_AMOUNT_USD,
-                    status="created",
-                )
-            )
+            session.add(Payments(user_id=user.id, uuid=uuid, amount_usd=settings.ENTRY_AMOUNT_USD, status="created"))
             await message.answer(
                 I18N["pay_1"][user.lang] + f"\n\n{link}",
-                reply_markup=InlineKeyboardMarkup(
-                    inline_keyboard=[
-                        [InlineKeyboardButton(text="✅ Я оплатив(ла)", callback_data=f"paid:{uuid}")]
-                    ]
-                ),
+                reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                    [InlineKeyboardButton(text="✅ Я оплатив(ла)", callback_data=f"paid:{uuid}")]
+                ]),
             )
             return
 
-    # else show main menu
+    # інакше — меню
     await message.answer(I18N["menu"][user.lang], reply_markup=main_menu(user.lang))
-    if message.from_user.id in ADMINS_LIST:
+    if tg_id in ADMINS_LIST:
         await message.answer("Ти адмін 👉 /admin")
+
 
 
 @user_router.callback_query(F.data.startswith("lang:"))
