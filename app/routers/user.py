@@ -260,8 +260,10 @@ async def handle_tasks(message: Message, session: AsyncSession):
         await message.answer("Поки немає доступних завдань. Зайдіть трохи згодом.")
         return
 
-    title = getattr(task, f"title_{user.lang}")
+    # title може бути порожній — тоді просто показуємо опис без заголовка
+    title = (getattr(task, f"title_{user.lang}") or "").strip()
     desc = getattr(task, f"desc_{user.lang}")
+    text = f"<b>{title}</b>\n\n{desc}" if title else desc
 
     kb = InlineKeyboardMarkup(
         inline_keyboard=[
@@ -269,7 +271,8 @@ async def handle_tasks(message: Message, session: AsyncSession):
             [InlineKeyboardButton(text="Перевірити", callback_data=f"chk:{task.id}")],
         ]
     )
-    await message.answer(f"<b>{title}</b>\n\n{desc}", reply_markup=kb, parse_mode="HTML")
+    await message.answer(text, reply_markup=kb, parse_mode="HTML")
+
 
 
 @user_router.callback_query(F.data.startswith("chk:"))
