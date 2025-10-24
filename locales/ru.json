@@ -28,7 +28,7 @@
   "withdraw_crypto": "Криптовалюта",
   "withdraw_card": "Банковская карта",
   "withdraw_other": "Другое",
-  "withdraw_details": "Введите реквизиты (например: сеть+адрес USDT или номер карты):",
+  "withdraw_details": "Введите реквизиты (например: сеть+адрес USDT или номер карты, или -):",
   "withdraw_amount": "Укажите сумму QC (или 0 — весь доступный баланс):",
   "withdraw_confirm": "Подтвердить заявку на {qc} QC?\nСтрана: {country}\nСпособ: {method}\nРеквизиты: {details}",
   "withdraw_saved": "Заявка создана! Админ проверит и свяжется.",
