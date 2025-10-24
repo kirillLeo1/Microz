@@ -6,6 +6,7 @@ from ..services.tasks_service import (get_user, list_chains, list_chain_steps, u
                                       get_cooldown_left, set_cooldown, inc_today_and_check_limit,
                                       award_qc, mark_step_completed)
 from aiogram.exceptions import TelegramBadRequest
+from ..utils.tg import replace_message
 
 router = Router()
 
@@ -49,7 +50,8 @@ async def open_chain(cb: CallbackQuery):
     reward = st["reward_qc"]
     text = (f"<b>{title}</b>\n" if title and title!="-"
             else "") + f"{desc}\n\n" + i18n.t(lang,"reward", qc=reward)
-    await cb.message.edit_text(
+    await replace_message(
+        cb.message,
         text,
         reply_markup=step_kb(st["url"], i18n.t(lang,"check_btn"), i18n.t(lang,"open_btn"), st["id"], int(chain_id))
     )
