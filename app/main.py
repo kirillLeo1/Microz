@@ -33,6 +33,7 @@ def main_kb(lang: str):
 async def on_startup(bot: Bot):
     await connect()
     await ensure_schema()
+    await bot.get_me()
     await bot.set_my_commands([
         BotCommand(command="start", description="Start"),
         BotCommand(command="help", description="Help"),
