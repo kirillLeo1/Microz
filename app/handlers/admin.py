@@ -6,6 +6,7 @@ from ..utils.i18n import i18n
 from ..utils.keyboards import admin_menu_kb
 from ..db import fetch, fetchrow, execute
 from ..services.tasks_service import get_or_create_chain
+from ..utils.tg import replace_message
 
 router = Router()
 
@@ -34,7 +35,7 @@ async def admin_menu(cb: CallbackQuery):
         sum_earned = await fetchrow("SELECT COALESCE(SUM(earned_total_qc),0) s FROM users")
         payments = await fetchrow("SELECT COUNT(*) c FROM payments")
         refs = await fetchrow("SELECT COUNT(*) c FROM referral_rewards")
-        await cb.message.edit_text(i18n.t(lang,"stats_text", users=users["c"], active=active["c"],
+        await replace_message(cb.message, i18n.t(lang,"stats_text", users=users["c"], active=active["c"],
                                            sum_balance=sum_balance["s"], sum_earned=sum_earned["s"],
                                            payments=payments["c"], refs=refs["c"]))
     elif key=="tasks":
@@ -49,14 +50,14 @@ async def admin_menu(cb: CallbackQuery):
             )
         kb.row(__import__('aiogram.types').types.InlineKeyboardButton(text=i18n.t(lang,"new_chain"), callback_data="chain:new"))
         kb.row(__import__('aiogram.types').types.InlineKeyboardButton(text=i18n.t(lang,"back"), callback_data="admin:menu"))
-        await cb.message.edit_text(text, reply_markup=kb.as_markup())
+        await replace_message(cb.message, text, reply_markup=kb.as_markup())
     elif key=="broadcast":
-        await cb.message.edit_text(i18n.t(lang,"broadcast_enter"))
+        await replace_message(cb.message, i18n.t(lang,"broadcast_enter"))
         router.broadcast_wait[cb.from_user.id] = True
     elif key=="withdraws":
         rows = await fetch("SELECT * FROM withdrawals WHERE status='pending' ORDER BY id")
         if not rows:
-            await cb.message.edit_text(i18n.t(lang,"withdraw_list") + " (0)")
+            await replace_message(cb.message, i18n.t(lang,"withdraw_list") + " (0)")
             return
         from aiogram.utils.keyboard import InlineKeyboardBuilder
         kb = InlineKeyboardBuilder()
@@ -65,9 +66,9 @@ async def admin_menu(cb: CallbackQuery):
             parts.append(i18n.t(lang,"withdraw_card_admin", id=r["id"], user_id=r["user_id"], qc=r["amount_qc"],
                                 country=r["country"], method=r["method"], details=r["details"]))
             kb.row(__import__('aiogram.types').types.InlineKeyboardButton(text=f"#{r['id']}", callback_data=f"w:{r['id']}"))
-        await cb.message.edit_text("\n\n".join(parts), reply_markup=kb.as_markup())
+        await replace_message(cb.message, "\n\n".join(parts), reply_markup=kb.as_markup())
     elif key=="menu":
-        await cb.message.edit_text(i18n.t(lang,"admin_menu"), reply_markup=admin_menu_kb(i18n._texts[lang]))
+        await replace_message(cb.message, i18n.t(lang,"admin_menu"), reply_markup=admin_menu_kb(i18n._texts[lang]))
 
 router.broadcast_wait = {}
 
@@ -107,7 +108,7 @@ async def do_broadcast(cb: CallbackQuery):
             bad+=1
         await __import__('asyncio').sleep(0.05)
     lang = (await fetchrow("SELECT language FROM users WHERE tg_id=$1", cb.from_user.id))["language"] or "en"
-    await cb.message.edit_text(i18n.t(lang,"broadcast_done", ok=ok, bad=bad))
+    await replace_message(cb.message, i18n.t(lang,"broadcast_done", ok=ok, bad=bad))
 
 @router.callback_query(F.data.startswith("chain:"))
 async def chain_screen(cb: CallbackQuery):
@@ -118,7 +119,7 @@ async def chain_screen(cb: CallbackQuery):
     if cid=="new":
         # ask for key
         router.new_chain_wait[cb.from_user.id]="key"
-        await cb.message.edit_text("Enter chain key (latin, unique):")
+        await replace_message(cb.message, "Enter chain key (latin, unique):")
         return
     cid = int(cid)
     rows = await fetch("SELECT * FROM steps WHERE chain_id=$1 ORDER BY order_no", cid)
@@ -130,7 +131,7 @@ async def chain_screen(cb: CallbackQuery):
     kb.row(__import__('aiogram.types').types.InlineKeyboardButton(text=i18n.t(lang,"toggle_all"), callback_data=f"step:toggle:{cid}"))
     kb.row(__import__('aiogram.types').types.InlineKeyboardButton(text=i18n.t(lang,"wipe_chain"), callback_data=f"step:wipe:{cid}"))
     kb.row(__import__('aiogram.types').types.InlineKeyboardButton(text=i18n.t(lang,"back"), callback_data="admin:tasks"))
-    await cb.message.edit_text(text, reply_markup=kb.as_markup())
+    await replace_message(cb.message, text, reply_markup=kb.as_markup())
 
 router.new_chain_wait = {}
 router.step_create_state = {}
@@ -151,20 +152,20 @@ async def step_ops(cb: CallbackQuery):
     lang = (await fetchrow("SELECT language FROM users WHERE tg_id=$1", cb.from_user.id))["language"] or "en"
     if op=="add":
         router.step_create_state[cb.from_user.id] = {"cid": cid, "stage": "desc_uk"}
-        await cb.message.edit_text(i18n.t(lang,"ask_desc_uk"))
+        await replace_message(cb.message, i18n.t(lang,"ask_desc_uk"))
     elif op=="del_last":
         last = await fetchrow("SELECT id FROM steps WHERE chain_id=$1 ORDER BY order_no DESC LIMIT 1", cid)
         if last:
             await execute("DELETE FROM steps WHERE id=$1", last["id"])
-            await cb.message.edit_text(i18n.t(lang,"deleted"))
+            await replace_message(cb.message, i18n.t(lang,"deleted"))
     elif op=="toggle":
         # flip all
         await execute("UPDATE steps SET is_active = NOT is_active WHERE chain_id=$1", cid)
-        await cb.message.edit_text(i18n.t(lang,"toggled"))
+        await replace_message(cb.message, i18n.t(lang,"toggled"))
     elif op=="wipe":
         await execute("DELETE FROM user_steps WHERE step_id IN (SELECT id FROM steps WHERE chain_id=$1)", cid)
         await execute("DELETE FROM steps WHERE chain_id=$1", cid)
-        await cb.message.edit_text(i18n.t(lang,"wiped"))
+        await replace_message(cb.message, i18n.t(lang,"wiped"))
 
 @router.message(lambda m: isinstance(router.step_create_state.get(m.from_user.id), dict))
 async def step_create_flow(msg: Message):
