@@ -56,56 +56,41 @@ async def open_chain(cb: CallbackQuery):
 
     # Store context for "step_check":
 
-@router.callback_query(F.data=="step_check")
+@router.callback_query(F.data.startswith("step_check:"))
 async def check_step(cb: CallbackQuery):
-    # We get the latest step shown from the message by parsing reward or by storing state per user.
-    # Simplify: find the earliest open step in any chain w/o cooldown.
+    _, step_id, chain_id = cb.data.split(":")
+    step_id = int(step_id); chain_id = int(chain_id)
+
     user = await get_user(cb.from_user.id)
     lang = user["language"]
-    from ..db import fetch, fetchrow
-    chains = await fetch("SELECT id FROM chains ORDER BY id")
-    # find the step that matches on screen by reading last shown step_id from a hidden entity would be better;
-    # for brevity, just recompute allowed next per chain and pick the first available matching URL from message text.
-    # Implementation below: iterate chains and choose first eligible step whose desc/title fragments are in message.
-    chosen = None
-    for ch in chains:
-        nxt = await fetchrow("""
-            SELECT s.* FROM steps s
-            WHERE s.chain_id=$1 AND s.is_active=TRUE
-              AND s.id NOT IN (SELECT step_id FROM user_steps WHERE user_id=(SELECT id FROM users WHERE tg_id=$2))
-            ORDER BY s.order_no ASC
-            LIMIT 1
-        """, ch["id"], cb.from_user.id)
-        if not nxt:
-            continue
-        cd = await get_cooldown_left(cb.from_user.id, ch["id"])
-        if cd>0:
-            continue
-        # naive pick first eligible
-        chosen = (ch["id"], nxt)
-        break
-    if not chosen:
-        await cb.answer(i18n.t(lang,"not_done"), show_alert=True)
+
+    from ..db import fetchrow
+    st = await fetchrow("SELECT * FROM steps WHERE id=$1", step_id)
+    if not st:
+        await cb.answer(i18n.t(lang, "not_done"), show_alert=True)
         return
-    chain_id, st = chosen
-    # Verify (if Telegram chat check is possible)
+
     ok = True
     if st["verify_chat_id"]:
         try:
-            member = await cb.message.bot.get_chat_member(st["verify_chat_id"], cb.from_user.id)
-            ok = (member is not None and member.status in ("member","administrator","creator"))
+            member = await cb.bot.get_chat_member(st["verify_chat_id"], cb.from_user.id)
+            ok = (member is not None and getattr(member, "status", None) in ("member", "administrator", "creator"))
         except TelegramBadRequest:
             ok = False
     if not ok:
-        await cb.answer(i18n.t(lang,"not_done"), show_alert=True)
+        await cb.answer(i18n.t(lang, "not_done"), show_alert=True)
         return
-    # Daily limit
+
     if not await inc_today_and_check_limit(cb.from_user.id):
-        await cb.answer(i18n.t(lang,"daily_limit_hit"), show_alert=True)
+        await cb.answer(i18n.t(lang, "daily_limit_hit"), show_alert=True)
         return
-    # Award & mark completed, set cooldown
+
     await award_qc(cb.from_user.id, st["reward_qc"])
     await mark_step_completed(cb.from_user.id, st["id"])
     await set_cooldown(cb.from_user.id, chain_id)
     await cb.answer("OK ✅")
-    await cb.message.delete()
+    try:
+        await cb.message.delete()
+    except Exception:
+        pass
+
