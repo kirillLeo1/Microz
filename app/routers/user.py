@@ -15,7 +15,7 @@ from aiogram.fsm.context import FSMContext
 from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from ..config import settings
+from ..config import settings, ADMINS_LIST
 from ..models import (
     Users,
     Payments,
@@ -57,7 +57,6 @@ async def start(message: Message, session: AsyncSession):
 
     referrer_id = None
     if payload and payload.startswith("start="):
-        # expected "?start=<tg_id>" from deep-link; here it comes as "start=<tg_id>"
         try:
             referrer_id = int(payload.split("=", 1)[1])
         except Exception:
@@ -85,11 +84,13 @@ async def start(message: Message, session: AsyncSession):
 
     # if inactive → create CryptoCloud invoice and show link
     if str(user.status) in {"inactive", UserStatus.inactive}:
-        inv = await create_invoice(settings.ENTRY_AMOUNT_USD, order_id=f"u{user.id}")
-        uuid = inv.get("result", {}).get("uuid")
-        link = inv.get("result", {}).get("link")
+        try:
+            inv = await create_invoice(settings.ENTRY_AMOUNT_USD, order_id=f"u{user.id}")
+            uuid = inv.get("result", {}).get("uuid")
+            link = inv.get("result", {}).get("link")
+        except Exception as e:
+            uuid = link = None
         if uuid and link:
-            # save payment record (idempotent by uuid unique in DB)
             session.add(
                 Payments(
                     user_id=user.id,
@@ -99,15 +100,10 @@ async def start(message: Message, session: AsyncSession):
                 )
             )
             await message.answer(
-                I18N["pay_1"][user.lang]
-                + f"\n\n{link}",
+                I18N["pay_1"][user.lang] + f"\n\n{link}",
                 reply_markup=InlineKeyboardMarkup(
                     inline_keyboard=[
-                        [
-                            InlineKeyboardButton(
-                                text="✅ Я оплатив(ла)", callback_data=f"paid:{uuid}"
-                            )
-                        ]
+                        [InlineKeyboardButton(text="✅ Я оплатив(ла)", callback_data=f"paid:{uuid}")]
                     ]
                 ),
             )
@@ -115,15 +111,66 @@ async def start(message: Message, session: AsyncSession):
 
     # else show main menu
     await message.answer(I18N["menu"][user.lang], reply_markup=main_menu(user.lang))
+    if message.from_user.id in ADMINS_LIST:
+        await message.answer("Ти адмін 👉 /admin")
 
 
 @user_router.callback_query(F.data.startswith("lang:"))
 async def set_lang(cq: CallbackQuery, session: AsyncSession):
     lang = cq.data.split(":", 1)[1]
+    # зберігаємо мову
     await session.execute(
         update(Users).where(Users.tg_id == cq.from_user.id).values(lang=lang)
     )
-    await cq.message.edit_text(I18N["menu"][lang])
+
+    # перезавантажимо юзера, щоб знати статус
+    user = (
+        await session.execute(select(Users).where(Users.tg_id == cq.from_user.id))
+    ).scalar_one()
+
+    # якщо юзер не активний — одразу пропонуємо оплату $1
+    if str(user.status) in {"inactive", UserStatus.inactive}:
+        try:
+            inv = await create_invoice(settings.ENTRY_AMOUNT_USD, order_id=f"u{user.id}")
+            uuid = inv.get("result", {}).get("uuid")
+            link = inv.get("result", {}).get("link")
+        except Exception:
+            uuid = link = None
+
+        if uuid and link:
+            session.add(
+                Payments(
+                    user_id=user.id,
+                    uuid=uuid,
+                    amount_usd=settings.ENTRY_AMOUNT_USD,
+                    status="created",
+                )
+            )
+            # оновимо повідомлення й дамо кнопку оплатити
+            try:
+                await cq.message.edit_text(I18N["pay_1"][lang] + f"\n\n{link}")
+            except Exception:
+                await cq.message.answer(I18N["pay_1"][lang] + f"\n\n{link}")
+            await cq.message.answer(
+                "Після оплати натисніть:",
+                reply_markup=InlineKeyboardMarkup(
+                    inline_keyboard=[
+                        [InlineKeyboardButton(text="✅ Я оплатив(ла)", callback_data=f"paid:{uuid}")]
+                    ]
+                ),
+            )
+            await cq.answer()
+            return
+
+    # якщо юзер уже активний або інвойс не створився — просто показуємо меню з клавіатурою
+    try:
+        await cq.message.edit_text(I18N["menu"][lang])
+    except Exception:
+        pass
+    await cq.message.answer(I18N["menu"][lang], reply_markup=main_menu(lang))
+    if cq.from_user.id in ADMINS_LIST:
+        await cq.message.answer("Ти адмін 👉 /admin")
+    await cq.answer()
 
 
 @user_router.callback_query(F.data.startswith("paid:"))
@@ -134,13 +181,17 @@ async def check_paid(cq: CallbackQuery, session: AsyncSession):
     status = items[0].get("status") if items else None
 
     if status in {"paid", "overpaid", "partial"}:
-        # set user active (string to match DB)
         await session.execute(
-            update(Users)
-            .where(Users.tg_id == cq.from_user.id)
-            .values(status="active")
+            update(Users).where(Users.tg_id == cq.from_user.id).values(status="active")
         )
         await cq.message.edit_text("✅ Активовано! Відкрийте меню та продовжуйте.")
+        # покажемо меню
+        user = (
+            await session.execute(select(Users).where(Users.tg_id == cq.from_user.id))
+        ).scalar_one()
+        await cq.message.answer(I18N["menu"][user.lang], reply_markup=main_menu(user.lang))
+        if cq.from_user.id in ADMINS_LIST:
+            await cq.message.answer("Ти адмін 👉 /admin")
     else:
         await cq.answer("Платіж ще не підтверджено. Спробуйте пізніше.", show_alert=True)
 
@@ -182,8 +233,6 @@ async def check_task(cq: CallbackQuery, session: AsyncSession):
         await session.execute(select(Tasks).where(Tasks.id == task_id))
     ).scalar_one()
 
-    # 1) Якщо TG-канал і бот має права — перевіряємо підписку
-    # 2) Якщо не TG або немає прав — працює UX-перевірка (вважаємо ок)
     ok = await check_telegram_membership(cq.bot, task.url, cq.from_user.id) or True
 
     if ok:
@@ -258,7 +307,6 @@ async def withdraw_method(message: Message, state: FSMContext):
 async def withdraw_details(message: Message, state: FSMContext, session: AsyncSession):
     await state.update_data(details=message.text.strip())
 
-    # default amount = full balance
     user = (
         await session.execute(select(Users).where(Users.tg_id == message.from_user.id))
     ).scalar_one()
@@ -343,3 +391,4 @@ async def withdraw_ok(cq: CallbackQuery, state: FSMContext, session: AsyncSessio
     )
     await state.clear()
     await cq.message.edit_text("Заявку створено. Адмін зв’яжеться з вами для виплати.")
+
