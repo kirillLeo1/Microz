@@ -27,7 +27,7 @@ from ..models import (
 from ..keyboards import main_menu
 from ..i18n import I18N
 from ..services.cryptocloud import create_invoice, get_invoice_info
-from ..services.tasks import next_task_for_user, complete_task
+from ..services.tasks import next_tasks_per_chain, complete_task
 from ..services.utils_tg import check_telegram_membership
 user_router = Router()
 
