@@ -8,9 +8,9 @@ class I18N:
             p = pathlib.Path(locales_dir) / f"{code}.json"
             self._texts[code] = json.loads(p.read_text(encoding="utf-8"))
 
-    def t(self, lang: str, code: str, **kwargs) -> str:
-        lang = lang if lang in self._texts else "en"
-        s = self._texts[lang].get(code, code)
+    def t(self, lng: str, code: str, **kwargs) -> str:
+        language = lng if lng in self._texts else "en"
+        s = self._texts[language].get(code, code)
         if kwargs:
             try:
                 s = s.format(**kwargs)
