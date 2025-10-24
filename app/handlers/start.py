@@ -9,6 +9,7 @@ from ..utils.payments import create_invoice, get_invoices_info
 from ..db import fetchrow
 from ..services.tasks_service import create_invoice as db_create_invoice, set_payment_status
 from ..utils.tg import replace_message
+from aiogram.types import ReplyKeyboardRemove
 router = Router()
 
 def parse_ref(payload: str | None) -> int | None:
@@ -41,7 +42,9 @@ async def on_start(msg: Message):
         await msg.answer(f"<b>{texts['activate_title']}</b>\n{texts['activate_text']}", reply_markup=activation_kb(pay_url, texts))
         return
     # Main menu
-    await msg.answer(i18n.t(user["language"],"main_menu"))
+    lang = user['language']
+    await msg.answer(i18n.t(lang, 'main_menu'), reply_markup=ReplyKeyboardRemove())
+
 
 @router.callback_query(F.data.startswith("lang:"))
 async def set_lang(cb: CallbackQuery):
@@ -78,9 +81,15 @@ async def set_lang(cb: CallbackQuery):
     text = f"<b>{texts['activate_title']}</b>\n{texts['activate_text']}"
     kb = activation_kb(pay_url, texts)
 
-    # Замість edit_* — видаляємо старе і шлемо нове (анти 'message is not modified')
+    # 1) скидаємо reply-клавіатуру (це окреме повідомлення)
+    await cb.message.answer(" ", reply_markup=ReplyKeyboardRemove())
+
+    # 2) показуємо екран активації: delete + send (інлайн-кнопки всередині)
     await replace_message(cb.message, text, reply_markup=kb)
+    
+    # 3) закриваємо callback
     await cb.answer()
+
 
 @router.callback_query(F.data=="paid_check")
 async def on_paid(cb: CallbackQuery):
