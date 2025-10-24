@@ -51,8 +51,6 @@ async def open_chain(cb: CallbackQuery):
             else "") + f"{desc}\n\n" + i18n.t(lang,"reward", qc=reward)
     await cb.message.edit_text(text, reply_markup=step_kb(st["url"], i18n.t(lang,"check_btn"), i18n.t(lang,"open_btn")))
     # Store context for "step_check":
-    await cb.message.chat.set_action("typing")
-    await cb.message.bot.session.storage.redis  # no-op to keep type hints happy
 
 @router.callback_query(F.data=="step_check")
 async def check_step(cb: CallbackQuery):
