@@ -28,11 +28,12 @@ def tasks_chain_kb(items):
             kb.row(InlineKeyboardButton(text=text, callback_data="noop"))
     return kb.as_markup()
 
-def step_kb(open_url: str, check_text: str, open_text: str = "Open"):
+def step_kb(open_url: str, check_text: str, open_text: str, step_id: int, chain_id: int):
     kb = InlineKeyboardBuilder()
     kb.row(InlineKeyboardButton(text=open_text, url=open_url))
-    kb.row(InlineKeyboardButton(text=check_text, callback_data="step_check"))
+    kb.row(InlineKeyboardButton(text=check_text, callback_data=f"step_check:{step_id}:{chain_id}"))
     return kb.as_markup()
+
 
 def admin_menu_kb(texts):
     kb = InlineKeyboardBuilder()
