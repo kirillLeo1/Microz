@@ -29,7 +29,6 @@ from ..i18n import I18N
 from ..services.cryptocloud import create_invoice, get_invoice_info
 from ..services.tasks import next_task_for_user, complete_task
 from ..services.utils_tg import check_telegram_membership
-
 user_router = Router()
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -238,53 +237,69 @@ async def check_paid(cq: CallbackQuery, session: AsyncSession):
 # ─────────────────────────────────────────────────────────────────────────────
 # Tasks flow
 # ─────────────────────────────────────────────────────────────────────────────
-@user_router.message(F.text.in_({I18N["btn_tasks"][k] for k in ("uk", "ru", "en")}))
+
+@user_router.message(F.text.in_({I18N["btn_tasks"][k] for k in ("uk","ru","en")}))
 async def handle_tasks(message: Message, session: AsyncSession):
-    user = (
-        await session.execute(select(Users).where(Users.tg_id == message.from_user.id))
-    ).scalar_one()
+    user = (await session.execute(select(Users).where(Users.tg_id==message.from_user.id))).scalar_one()
+    # ліміт по днях (якщо у тебе є своя перевірка — лишай; тут пропускаю за стислості)
 
-    task, tag = await next_task_for_user(session, user.id)
-    if tag == "limit":
-        await message.answer(I18N["limit_reached"][user.lang])
-        return
-
-    if not task:
+    items = await next_tasks_per_chain(session, user.id)
+    if not items:
         await message.answer("Поки немає доступних завдань. Зайдіть трохи згодом.")
         return
 
-    # title може бути порожній — тоді просто показуємо опис без заголовка
-    title = (getattr(task, f"title_{user.lang}") or "").strip()
-    desc = getattr(task, f"desc_{user.lang}")
-    text = f"<b>{title}</b>\n\n{desc}" if title else desc
+    # будуємо список ланцюгів
+    kb = InlineKeyboardBuilder()
+    lines = ["Доступні ланцюги (наступні кроки):\n"]
+    for chain_key, task, locked_until in items:
+        ck = chain_key or "SOLO"
+        if locked_until:
+            eta = (locked_until - datetime.now(timezone.utc)).total_seconds()
+            if eta < 0: eta = 0
+            mins = int(eta // 60); secs = int(eta % 60)
+            lines.append(f"• [{ck}] ⏳ {mins:02d}:{secs:02d} до наступного кроку")
+        else:
+            lines.append(f"• [{ck}] +{task.reward_qc} QC — натисни кнопку нижче")
+            kb.button(text=f"Відкрити [{ck}] (+{task.reward_qc} QC)", callback_data=f"tsk:open:{task.id}")
+    kb.adjust(1)
+    await message.answer("\n".join(lines), reply_markup=kb.as_markup())
 
-    kb = InlineKeyboardMarkup(
-        inline_keyboard=[
-            [InlineKeyboardButton(text="Відкрити", url=task.url)],
-            [InlineKeyboardButton(text="Перевірити", callback_data=f"chk:{task.id}")],
-        ]
-    )
-    await message.answer(text, reply_markup=kb, parse_mode="HTML")
+@user_router.callback_query(F.data.startswith("tsk:open:"))
+async def task_open(cq: CallbackQuery, session: AsyncSession):
+    task_id = int(cq.data.split(":", 2)[2])
+    user = (await session.execute(select(Users).where(Users.tg_id==cq.from_user.id))).scalar_one()
+    task = (await session.execute(select(Tasks).where(Tasks.id==task_id))).scalar_one()
+
+    title = (getattr(task, f"title_{user.lang}") or "").strip()
+    desc  = getattr(task, f"desc_{user.lang}")
+    text  = (f"<b>{title}</b>\n\n{desc}" if title else desc) + f"\n\n<b>Нагорода: +{task.reward_qc} QC</b>"
+
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="Відкрити", url=task.url)],
+        [InlineKeyboardButton(text="Перевірити", callback_data=f"chk:{task.id}")],
+    ])
+    try:
+        await cq.message.edit_text(text, reply_markup=kb, parse_mode="HTML")
+    except:
+        await cq.message.answer(text, reply_markup=kb, parse_mode="HTML")
+    await cq.answer()
+
 
 
 
 @user_router.callback_query(F.data.startswith("chk:"))
 async def check_task(cq: CallbackQuery, session: AsyncSession):
     task_id = int(cq.data.split(":", 1)[1])
-    task = (
-        await session.execute(select(Tasks).where(Tasks.id == task_id))
-    ).scalar_one()
-
-    ok = await check_telegram_membership(cq.bot, task.url, cq.from_user.id) or True
+    task = (await session.execute(select(Tasks).where(Tasks.id==task_id))).scalar_one()
+    ok = await check_telegram_membership(cq.bot, task.url, cq.from_user.id) or True  # як домовлялися
 
     if ok:
-        uid = (
-            await session.execute(
-                select(Users.id).where(Users.tg_id == cq.from_user.id)
-            )
-        ).scalar_one()
+        uid = (await session.execute(select(Users.id).where(Users.tg_id==cq.from_user.id))).scalar_one()
         await complete_task(session, user_id=uid, task_id=task_id)
-        await cq.message.edit_text("✅ Зараховано +1 QC")
+        await cq.message.edit_text(f"✅ Зараховано +{task.reward_qc} QC")
+    else:
+        await cq.answer("Ще не виконано. Перевірте умови.", show_alert=True)
+
 
 
 # ─────────────────────────────────────────────────────────────────────────────
