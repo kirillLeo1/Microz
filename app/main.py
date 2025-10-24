@@ -14,7 +14,7 @@ from .routers.admin import admin_router
 from .models import Users, Payments, UserStatus
 from .services.cryptocloud import verify_postback_jwt
 from .services.referrals import grant_referral_bonus
-
+from .db import engine, Base
 bot = Bot(token=settings.BOT_TOKEN, default=DefaultBotProperties(parse_mode="HTML"))
 dp = Dispatcher(storage=MemoryStorage())
 dp.message.middleware(DBSessionMiddleware())
@@ -22,10 +22,22 @@ dp.callback_query.middleware(DBSessionMiddleware())
 dp.include_router(user_router)
 dp.include_router(admin_router)
 
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    await bot.set_webhook(url=f"{settings.PUBLIC_URL}/tg/{settings.WEBHOOK_SECRET}", secret_token=settings.WEBHOOK_SECRET, drop_pending_updates=True, allowed_updates=["message","callback_query"]) 
+    # 1) створимо таблиці, якщо їх ще нема (це не заміна Alembic, але розблокує запуск)
+    async with engine.begin() as conn:
+        await conn.run_sync(Base.metadata.create_all)
+
+    # 2) ставимо вебхук
+    await bot.set_webhook(
+        url=f"{settings.PUBLIC_URL}/tg/{settings.WEBHOOK_SECRET}",
+        secret_token=settings.WEBHOOK_SECRET,
+        drop_pending_updates=True,
+        allowed_updates=["message","callback_query"]
+    )
     yield
+
 
 app = FastAPI(lifespan=lifespan)
 
