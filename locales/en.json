@@ -28,7 +28,7 @@
   "withdraw_crypto": "Crypto",
   "withdraw_card": "Bank card",
   "withdraw_other": "Other",
-  "withdraw_details": "Enter payout details (e.g., USDT network+address or card number):",
+  "withdraw_details": "Enter payout details (e.g., USDT network+address or card number or -):",
   "withdraw_amount": "Enter QC amount (or 0 — whole available balance):",
   "withdraw_confirm": "Confirm withdraw for {qc} QC?\nCountry: {country}\nMethod: {method}\nDetails: {details}",
   "withdraw_saved": "Request created! Admin will review and contact you.",
