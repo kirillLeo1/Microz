@@ -15,7 +15,6 @@ from sqlalchemy import (
     Index,
 )
 from sqlalchemy.orm import Mapped, mapped_column, relationship
-
 from .db import Base
 
 
@@ -84,12 +83,12 @@ class Tasks(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=datetime.utcnow, index=True)
 
 
+
 class UserTasks(Base):
     __tablename__ = "user_tasks"
-
     id: Mapped[int] = mapped_column(primary_key=True)
-    user_id: Mapped[int] = mapped_column(ForeignKey("users.id"), index=True)
-    task_id: Mapped[int] = mapped_column(ForeignKey("tasks.id"), index=True)
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), index=True)
+    task_id: Mapped[int] = mapped_column(ForeignKey("tasks.id", ondelete="CASCADE"), index=True)
     status: Mapped[str] = mapped_column(String(16), default="pending", index=True)
     available_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), index=True)
     completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), index=True)
