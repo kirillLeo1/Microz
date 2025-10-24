@@ -176,6 +176,26 @@ async def set_lang(cq: CallbackQuery, session: AsyncSession):
 @user_router.callback_query(F.data.startswith("paid:"))
 async def check_paid(cq: CallbackQuery, session: AsyncSession):
     uuid = cq.data.split(":", 1)[1]
+
+    # 🔧 DEV: миттєва активація у тесті (без звернення до CryptoCloud)
+    if settings.DEV_FAKE_PAY:
+        await session.execute(
+            update(Users).where(Users.tg_id == cq.from_user.id).values(status="active")
+        )
+        await session.execute(
+            update(Payments).where(Payments.uuid == uuid).values(status="paid")
+        )
+        await session.commit()
+
+        await cq.message.edit_text("✅ DEV: Активовано без оплати (тестовий режим).")
+        user = (
+            await session.execute(select(Users).where(Users.tg_id == cq.from_user.id))
+        ).scalar_one()
+        await cq.message.answer(I18N["menu"][user.lang], reply_markup=main_menu(user.lang))
+        await cq.answer()
+        return
+
+    # ↓↓↓ реальна перевірка для продакшена
     data = await get_invoice_info([uuid])
     items = (data or {}).get("result", [])
     status = items[0].get("status") if items else None
@@ -184,16 +204,20 @@ async def check_paid(cq: CallbackQuery, session: AsyncSession):
         await session.execute(
             update(Users).where(Users.tg_id == cq.from_user.id).values(status="active")
         )
+        await session.execute(
+            update(Payments).where(Payments.uuid == uuid).values(status=status)
+        )
+        await session.commit()
+
         await cq.message.edit_text("✅ Активовано! Відкрийте меню та продовжуйте.")
-        # покажемо меню
         user = (
             await session.execute(select(Users).where(Users.tg_id == cq.from_user.id))
         ).scalar_one()
         await cq.message.answer(I18N["menu"][user.lang], reply_markup=main_menu(user.lang))
-        if cq.from_user.id in ADMINS_LIST:
-            await cq.message.answer("Ти адмін 👉 /admin")
+        await cq.answer()
     else:
         await cq.answer("Платіж ще не підтверджено. Спробуйте пізніше.", show_alert=True)
+
 
 
 # ─────────────────────────────────────────────────────────────────────────────
