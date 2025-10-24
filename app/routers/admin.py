@@ -138,212 +138,229 @@ async def adm_broadcast_send(m: Message, state: FSMContext, session: AsyncSessio
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Task creation wizard
+# Tasks (chains-first UX)
 # ─────────────────────────────────────────────────────────────────────────────
-
-class TaskNewSG(StatesGroup):
-    title_uk = State()
-    title_ru = State()
-    title_en = State()
+class ChainAddStepSG(StatesGroup):
+    chain_key = State()
     desc_uk = State()
     desc_ru = State()
     desc_en = State()
     url = State()
-    chain = State()
-    cooldown = State()
-    copies = State()
 
+class ChainCreateSG(StatesGroup):
+    desc_uk = State()
+    desc_ru = State()
+    desc_en = State()
+    url = State()
 
-@admin_router.callback_query(F.data == "adm:task_new")
-async def adm_task_new(cq: CallbackQuery, state: FSMContext):
-    if not await _require_admin_cq(cq):
-        return
-    await state.set_state(TaskNewSG.title_uk)
-    await cq.message.edit_text("Введіть ЗАГОЛОВОК (укр)")
+def _title_placeholder() -> str:
+    return ""
 
-
-@admin_router.message(TaskNewSG.title_uk)
-async def tnew_title_uk(m: Message, state: FSMContext):
-    await state.update_data(title_uk=m.text.strip())
-    await state.set_state(TaskNewSG.title_ru)
-    await m.answer("ЗАГОЛОВОК (рус)")
-
-
-@admin_router.message(TaskNewSG.title_ru)
-async def tnew_title_ru(m: Message, state: FSMContext):
-    await state.update_data(title_ru=m.text.strip())
-    await state.set_state(TaskNewSG.title_en)
-    await m.answer("TITLE (en)")
-
-
-@admin_router.message(TaskNewSG.title_en)
-async def tnew_title_en(m: Message, state: FSMContext):
-    await state.update_data(title_en=m.text.strip())
-    await state.set_state(TaskNewSG.desc_uk)
-    await m.answer("ОПИС (укр)")
-
-
-@admin_router.message(TaskNewSG.desc_uk)
-async def tnew_desc_uk(m: Message, state: FSMContext):
-    await state.update_data(desc_uk=m.text.strip())
-    await state.set_state(TaskNewSG.desc_ru)
-    await m.answer("ОПИСАНИЕ (рус)")
-
-
-@admin_router.message(TaskNewSG.desc_ru)
-async def tnew_desc_ru(m: Message, state: FSMContext):
-    await state.update_data(desc_ru=m.text.strip())
-    await state.set_state(TaskNewSG.desc_en)
-    await m.answer("DESCRIPTION (en)")
-
-
-@admin_router.message(TaskNewSG.desc_en)
-async def tnew_desc_en(m: Message, state: FSMContext):
-    await state.update_data(desc_en=m.text.strip())
-    await state.set_state(TaskNewSG.url)
-    await m.answer("URL (t.me/... або будь-який)")
-
-
-@admin_router.message(TaskNewSG.url)
-async def tnew_url(m: Message, state: FSMContext):
-    await state.update_data(url=m.text.strip())
-    await state.set_state(TaskNewSG.chain)
-
-    kb = InlineKeyboardBuilder()
-    kb.button(text="Без ланцюга", callback_data="tnew:chain:off")
-    kb.button(text="Ланцюг ON", callback_data="tnew:chain:on")
-    kb.adjust(1)
-
-    await m.answer("Чи включати ланцюг (chain_key)?", reply_markup=kb.as_markup())
-
-
-@admin_router.callback_query(F.data.startswith("tnew:chain:"))
-async def tnew_chain(cq: CallbackQuery, state: FSMContext):
-    if not await _require_admin_cq(cq):
-        return
-    on = cq.data.endswith("on")
-    await state.update_data(chain_on=on)
-    await state.set_state(TaskNewSG.cooldown)
-    await cq.message.edit_text("Cooldown у секундах (за замовчуванням 1800). Введіть число.")
-
-
-@admin_router.message(TaskNewSG.cooldown)
-async def tnew_cooldown(m: Message, state: FSMContext):
-    try:
-        cd = int(m.text.strip())
-    except Exception:
-        cd = 1800
-    await state.update_data(cooldown=cd)
-    await state.set_state(TaskNewSG.copies)
-    await m.answer("Скільки копій створити? (N; 1 — одиночне)")
-
-
-@admin_router.message(TaskNewSG.copies)
-async def tnew_copies(m: Message, state: FSMContext, session: AsyncSession):
-    try:
-        copies = max(1, int(m.text.strip()))
-    except Exception:
-        copies = 1
-
-    data = await state.get_data()
-    chain_key: Optional[str] = None
-    if data.get("chain_on"):
-        chain_key = f"chain:{uuid.uuid4().hex[:12]}"
-
-    for _ in range(copies):
-        session.add(
-            Tasks(
-                title_uk=data["title_uk"],
-                title_ru=data["title_ru"],
-                title_en=data["title_en"],
-                desc_uk=data["desc_uk"],
-                desc_ru=data["desc_ru"],
-                desc_en=data["desc_en"],
-                url=data["url"],
-                reward_qc=1,
-                chain_key=chain_key,
-                cooldown_sec=int(data["cooldown"]),
-                is_active=True,
-            )
-        )
-
-    await state.clear()
-    await m.answer(f"✅ Створено {copies} завдання(нь){' у ланцюгу' if chain_key else ''}.")
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Task list / toggle / delete
-# ─────────────────────────────────────────────────────────────────────────────
-
-@admin_router.callback_query(F.data.startswith("adm:task_list:"))
-async def adm_task_list(cq: CallbackQuery, session: AsyncSession):
+@admin_router.callback_query(F.data == "adm:task_new")  # залишаємо старий entry як alias
+@admin_router.callback_query(F.data == "adm:tasks")
+async def adm_tasks_home(cq: CallbackQuery, session: AsyncSession):
     if not await _require_admin_cq(cq):
         return
 
-    page = int(cq.data.split(":")[2])
+    # групуємо за chain_key; соло-кей = NULL вважаємо окремими ланцюгами (по одному кроку)
     rows = (
         await session.execute(
-            select(Tasks).order_by(Tasks.created_at.desc()).limit(PAGE_SIZE).offset(page * PAGE_SIZE)
+            select(Tasks.chain_key, func.count(Tasks.id), func.bool_or(Tasks.is_active))
+            .group_by(Tasks.chain_key)
+            .order_by(func.min(Tasks.created_at).asc())
+        )
+    ).all()
+
+    if not rows:
+        kb = InlineKeyboardBuilder()
+        kb.button(text="➕ Створити ланцюг", callback_data="chain:create")
+        await cq.message.edit_text("Немає завдань. Створити перший ланцюг?", reply_markup=kb.as_markup())
+        return
+
+    lines = ["Ланцюги завдань:\n"]
+    kb = InlineKeyboardBuilder()
+    for chain_key, cnt, any_active in rows:
+        ck = chain_key or f"solo:{uuid.uuid4().hex[:6]}"
+        lines.append(f"• {chain_key or 'SOLO'} — кроків: {cnt} — {'✅ активні' if any_active else '⛔️ вимкн'}")
+        kb.button(text=f"Керуати [{chain_key or 'SOLO'}]", callback_data=f"chain:view:{chain_key or 'NULL'}")
+    kb.button(text="➕ Новий ланцюг", callback_data="chain:create")
+    kb.adjust(1)
+    await cq.message.edit_text("\n".join(lines), reply_markup=kb.as_markup())
+
+@admin_router.callback_query(F.data == "chain:create")
+async def chain_create_start(cq: CallbackQuery, state: FSMContext):
+    if not await _require_admin_cq(cq):
+        return
+    await state.set_state(ChainCreateSG.desc_uk)
+    await cq.message.edit_text("Опис (укр) для першого кроку:")
+
+@admin_router.message(ChainCreateSG.desc_uk)
+async def chain_create_desc_uk(m: Message, state: FSMContext):
+    await state.update_data(desc_uk=m.text.strip())
+    await state.set_state(ChainCreateSG.desc_ru)
+    await m.answer("Описание (рус) первого шага:")
+
+@admin_router.message(ChainCreateSG.desc_ru)
+async def chain_create_desc_ru(m: Message, state: FSMContext):
+    await state.update_data(desc_ru=m.text.strip())
+    await state.set_state(ChainCreateSG.desc_en)
+    await m.answer("Description (en) of the first step:")
+
+@admin_router.message(ChainCreateSG.desc_en)
+async def chain_create_desc_en(m: Message, state: FSMContext):
+    await state.update_data(desc_en=m.text.strip())
+    await state.set_state(ChainCreateSG.url)
+    await m.answer("URL (t.me/... або будь-який):")
+
+@admin_router.message(ChainCreateSG.url)
+async def chain_create_url(m: Message, state: FSMContext, session: AsyncSession):
+    data = await state.get_data()
+    chain_key = f"chain:{uuid.uuid4().hex[:12]}"
+    session.add(
+        Tasks(
+            title_uk=_title_placeholder(),
+            title_ru=_title_placeholder(),
+            title_en=_title_placeholder(),
+            desc_uk=data["desc_uk"],
+            desc_ru=data["desc_ru"],
+            desc_en=data["desc_en"],
+            url=m.text.strip(),
+            reward_qc=1,
+            chain_key=chain_key,
+            cooldown_sec=1800,  # 30 хв
+            is_active=True,
+        )
+    )
+    await state.clear()
+    kb = InlineKeyboardBuilder()
+    kb.button(text="➕ Додати крок", callback_data=f"chain:add:{chain_key}")
+    kb.button(text="⬅️ До списку", callback_data="adm:tasks")
+    kb.adjust(1)
+    await m.answer(f"✅ Створено ланцюг {chain_key} з першим кроком.", reply_markup=kb.as_markup())
+
+@admin_router.callback_query(F.data.startswith("chain:view:"))
+async def chain_view(cq: CallbackQuery, session: AsyncSession):
+    if not await _require_admin_cq(cq):
+        return
+    raw = cq.data.split(":", 2)[2]
+    chain_key = None if raw == "NULL" else raw
+
+    steps = (
+        await session.execute(
+            select(Tasks).where(Tasks.chain_key == chain_key).order_by(Tasks.created_at.asc())
         )
     ).scalars().all()
 
-    if not rows and page > 0:
-        await cq.answer("Немає більше сторінок.")
+    if not steps:
+        await cq.answer("Порожньо.", show_alert=True)
         return
 
-    text_lines = ["Список завдань:\n"]
-    for t in rows:
-        text_lines.append(
-            f"#{t.id} {'✅' if t.is_active else '⛔️'} | chain={t.chain_key or '-'} | cd={t.cooldown_sec}s | url={t.url}"
-        )
-    text = "\n".join(text_lines)
+    lines = [f"Ланцюг [{chain_key or 'SOLO'}]: {len(steps)} крок(ів)\n"]
+    for i, t in enumerate(steps, 1):
+        lines.append(f"{i}. #{t.id} {'✅' if t.is_active else '⛔️'} url={t.url}")
 
     kb = InlineKeyboardBuilder()
-    for t in rows:
-        kb.button(text=f"Toggle #{t.id}", callback_data=f"adm:tgl:{t.id}:{page}")
-        kb.button(text=f"Del #{t.id}", callback_data=f"adm:del:{t.id}:{page}")
-    if page > 0:
-        kb.button(text="⬅️", callback_data=f"adm:task_list:{page-1}")
-    kb.button(text="➡️", callback_data=f"adm:task_list:{page+1}")
-    kb.adjust(2)
+    kb.button(text="➕ Додати крок", callback_data=f"chain:add:{chain_key or 'NULL'}")
+    kb.button(text="🗑 Видалити останній", callback_data=f"chain:del_last:{chain_key or 'NULL'}")
+    kb.button(text="⛔️/✅ Toggle всі", callback_data=f"chain:tgl:{chain_key or 'NULL'}")
+    kb.button(text="⬅️ Назад", callback_data="adm:tasks")
+    kb.adjust(1)
+    await cq.message.edit_text("\n".join(lines), reply_markup=kb.as_markup())
 
-    await cq.message.edit_text(text, reply_markup=kb.as_markup())
-
-
-@admin_router.callback_query(F.data.startswith("adm:tgl:"))
-async def adm_task_toggle(cq: CallbackQuery, session: AsyncSession):
+@admin_router.callback_query(F.data.startswith("chain:add:"))
+async def chain_add_step_start(cq: CallbackQuery, state: FSMContext):
     if not await _require_admin_cq(cq):
         return
+    raw = cq.data.split(":", 2)[2]
+    chain_key = None if raw == "NULL" else raw
+    await state.set_state(ChainAddStepSG.desc_uk)
+    await state.update_data(chain_key=chain_key)
+    await cq.message.edit_text(f"Додаємо крок у [{chain_key or 'SOLO'}]\n\nОпис (укр):")
 
-    _, _, tid, page = cq.data.split(":")
-    tid = int(tid)
-    page = int(page)
+@admin_router.message(ChainAddStepSG.desc_uk)
+async def chain_add_step_desc_uk(m: Message, state: FSMContext):
+    await state.update_data(desc_uk=m.text.strip())
+    await state.set_state(ChainAddStepSG.desc_ru)
+    await m.answer("Описание (рус):")
 
-    task = (await session.execute(select(Tasks).where(Tasks.id == tid))).scalar_one_or_none()
-    if not task:
-        await cq.answer("Не знайдено.", show_alert=True)
-        return
+@admin_router.message(ChainAddStepSG.desc_ru)
+async def chain_add_step_desc_ru(m: Message, state: FSMContext):
+    await state.update_data(desc_ru=m.text.strip())
+    await state.set_state(ChainAddStepSG.desc_en)
+    await m.answer("Description (en):")
 
-    task.is_active = not task.is_active
-    await cq.answer("OK")
-    # перерендеримо список поточної сторінки
-    cq.data = f"adm:task_list:{page}"
-    await adm_task_list(cq, session)
+@admin_router.message(ChainAddStepSG.desc_en)
+async def chain_add_step_desc_en(m: Message, state: FSMContext):
+    await state.update_data(desc_en=m.text.strip())
+    await state.set_state(ChainAddStepSG.url)
+    await m.answer("URL:")
 
+@admin_router.message(ChainAddStepSG.url)
+async def chain_add_step_url(m: Message, state: FSMContext, session: AsyncSession):
+    data = await state.get_data()
+    chain_key = data["chain_key"]
+    session.add(
+        Tasks(
+            title_uk=_title_placeholder(),
+            title_ru=_title_placeholder(),
+            title_en=_title_placeholder(),
+            desc_uk=data["desc_uk"],
+            desc_ru=data["desc_ru"],
+            desc_en=data["desc_en"],
+            url=m.text.strip(),
+            reward_qc=1,
+            chain_key=chain_key,
+            cooldown_sec=1800,
+            is_active=True,
+        )
+    )
+    await state.clear()
+    await m.answer(f"✅ Додано крок у [{chain_key or 'SOLO'}].")
+    # повернемося до перегляду ланцюга
+    fake_cq = CallbackQuery(id=cq.id, from_user=m.from_user, chat_instance="", data=f"chain:view:{chain_key or 'NULL'}", message=m)  # type: ignore
+    await chain_view(fake_cq, session)
 
-@admin_router.callback_query(F.data.startswith("adm:del:"))
-async def adm_task_delete(cq: CallbackQuery, session: AsyncSession):
+@admin_router.callback_query(F.data.startswith("chain:del_last:"))
+async def chain_del_last(cq: CallbackQuery, session: AsyncSession):
+    from sqlalchemy import delete
     if not await _require_admin_cq(cq):
         return
+    raw = cq.data.split(":", 2)[2]
+    chain_key = None if raw == "NULL" else raw
+    last = (
+        await session.execute(
+            select(Tasks).where(Tasks.chain_key == chain_key).order_by(Tasks.created_at.desc()).limit(1)
+        )
+    ).scalar_one_or_none()
+    if not last:
+        await cq.answer("Нема що видаляти.", show_alert=True)
+        return
+    await session.execute(delete(Tasks).where(Tasks.id == last.id))
+    await cq.answer("Видалено останній крок.")
+    cq.data = f"chain:view:{raw}"
+    await chain_view(cq, session)
 
-    _, _, tid, page = cq.data.split(":")
-    tid = int(tid)
-    page = int(page)
+@admin_router.callback_query(F.data.startswith("chain:tgl:"))
+async def chain_toggle_all(cq: CallbackQuery, session: AsyncSession):
+    if not await _require_admin_cq(cq):
+        return
+    raw = cq.data.split(":", 2)[2]
+    chain_key = None if raw == "NULL" else raw
 
-    await session.execute(delete(Tasks).where(Tasks.id == tid))
-    await cq.answer("Deleted")
-    cq.data = f"adm:task_list:{page}"
-    await adm_task_list(cq, session)
+    # визначимо поточний стан за першим кроком
+    first = (
+        await session.execute(
+            select(Tasks.is_active).where(Tasks.chain_key == chain_key).order_by(Tasks.created_at.asc()).limit(1)
+        )
+    ).scalar_one_or_none()
+    new_state = not bool(first)
+    await session.execute(
+        update(Tasks).where(Tasks.chain_key == chain_key).values(is_active=new_state)
+    )
+    await cq.answer("Оновлено.")
+    cq.data = f"chain:view:{raw}"
+    await chain_view(cq, session)
+
 
 
 # ─────────────────────────────────────────────────────────────────────────────
