@@ -7,7 +7,8 @@ from .config import settings
 from .db import connect, close
 from .schema import ensure_schema
 from .handlers import start, profile, tasks, withdraw, admin
-
+from aiogram.client.default import DefaultBotProperties
+from aiogram.enums import ParseMode
 logging.basicConfig(level=logging.INFO)
 
 def main_kb(lang: str):
@@ -49,7 +50,10 @@ async def polling():
     dp.include_router(withdraw.router)
     dp.include_router(admin.router)
 
-    bot = Bot(token=settings.BOT_TOKEN, parse_mode="HTML")
+    bot = Bot(
+        token=settings.BOT_TOKEN,
+        default=DefaultBotProperties(parse_mode=ParseMode.HTML)
+    )
 
     async def startup(_):
         await on_startup(bot)
@@ -70,7 +74,10 @@ async def webhook():
     dp.include_router(withdraw.router)
     dp.include_router(admin.router)
 
-    bot = Bot(token=settings.BOT_TOKEN, parse_mode="HTML")
+    bot = Bot(
+        token=settings.BOT_TOKEN,
+        default=DefaultBotProperties(parse_mode=ParseMode.HTML)
+    )
 
     app = web.Application()
 
