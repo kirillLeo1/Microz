@@ -7,6 +7,8 @@ class Settings(BaseSettings):
     ADMIN_IDS: List[int] = Field(default_factory=list)
     DATABASE_URL: str
     CRYPTOCLOUD_API_KEY: str = ""
+    CRYPTOCLOUD_SHOP_ID: str = ""
+    CRYPTOCLOUD_CURRENCY: str = "USD"
     CRYPTOCLOUD_PRICE_USD: float = 1.00
     TEST_MODE: bool = False
     WEBHOOK_URL: str | None = None
