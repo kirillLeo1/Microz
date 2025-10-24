@@ -175,48 +175,70 @@ async def set_lang(cq: CallbackQuery, session: AsyncSession):
 
 @user_router.callback_query(F.data.startswith("paid:"))
 async def check_paid(cq: CallbackQuery, session: AsyncSession):
+    """
+    Перевірка оплати:
+    - DEV_FAKE_PAY=1 → миттєво активує, ставить payment=paid, нараховує 60 QC рефереру;
+    - Прод: тягне статус із CryptoCloud; якщо paid/overpaid/partial → активує та дає 60 QC рефереру.
+    Все ідемпотентно: бонус видається тільки один раз (див. services/referrals.py).
+    """
+    from ..services.referrals import grant_referral_bonus  # локальний імпорт, щоб уникнути циклів
+
     uuid = cq.data.split(":", 1)[1]
 
-    # 🔧 DEV: миттєва активація у тесті (без звернення до CryptoCloud)
+    # поточний юзер
+    user = (
+        await session.execute(select(Users).where(Users.tg_id == cq.from_user.id))
+    ).scalar_one()
+
+    # якщо вже активний — просто показуємо меню
+    if str(user.status) == "active":
+        await cq.answer()
+        await cq.message.edit_text("Ви вже активні 👌")
+        await cq.message.answer(I18N["menu"][user.lang], reply_markup=main_menu(user.lang))
+        return
+
+    # ── DEV: миттєва активація без реального платежу ─────────────────────────
     if settings.DEV_FAKE_PAY:
+        # user → active
         await session.execute(
-            update(Users).where(Users.tg_id == cq.from_user.id).values(status="active")
+            update(Users).where(Users.id == user.id).values(status="active")
         )
+        # payment → paid (якщо інвойс існує — оновимо статус, інакше просто пропустимо)
         await session.execute(
             update(Payments).where(Payments.uuid == uuid).values(status="paid")
         )
+        # реферальний бонус 60 QC (ідемпотентний усередині функції)
+        await grant_referral_bonus(session, referee_id=user.id)
         await session.commit()
 
         await cq.message.edit_text("✅ DEV: Активовано без оплати (тестовий режим).")
-        user = (
-            await session.execute(select(Users).where(Users.tg_id == cq.from_user.id))
-        ).scalar_one()
         await cq.message.answer(I18N["menu"][user.lang], reply_markup=main_menu(user.lang))
         await cq.answer()
         return
 
-    # ↓↓↓ реальна перевірка для продакшена
+    # ── Прод: реальна перевірка в CryptoCloud ─────────────────────────────────
     data = await get_invoice_info([uuid])
     items = (data or {}).get("result", [])
     status = items[0].get("status") if items else None
 
     if status in {"paid", "overpaid", "partial"}:
         await session.execute(
-            update(Users).where(Users.tg_id == cq.from_user.id).values(status="active")
+            update(Users).where(Users.id == user.id).values(status="active")
         )
         await session.execute(
             update(Payments).where(Payments.uuid == uuid).values(status=status)
         )
+        # реферальний бонус
+        from ..services.referrals import grant_referral_bonus
+        await grant_referral_bonus(session, referee_id=user.id)
         await session.commit()
 
         await cq.message.edit_text("✅ Активовано! Відкрийте меню та продовжуйте.")
-        user = (
-            await session.execute(select(Users).where(Users.tg_id == cq.from_user.id))
-        ).scalar_one()
         await cq.message.answer(I18N["menu"][user.lang], reply_markup=main_menu(user.lang))
         await cq.answer()
     else:
         await cq.answer("Платіж ще не підтверджено. Спробуйте пізніше.", show_alert=True)
+
 
 
 
