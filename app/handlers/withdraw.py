@@ -4,13 +4,47 @@ from aiogram.types import Message, ReplyKeyboardMarkup, KeyboardButton, ReplyKey
 from ..services.tasks_service import get_user
 from ..utils.i18n import i18n
 from ..db import fetchrow
-
+from ..config import settings
 router = Router()
 
 # --- СТАН ---
 class WState:
     stage = {}  # user_id -> 'country' | 'method' | 'details' | 'amount'
     data = {}   # user_id -> {'country':..., 'method':..., 'details':..., 'amount_qc':...}
+
+async def notify_admins_withdrawal(bot, user_row, wd_row, username: str | None):
+    """
+    Шле адмінам повідомлення про нову заявку.
+    user_row — рядок з таблиці users (ти вже маєш user у хендлерах),
+    wd_row — рядок з таблиці withdrawals, повернутий RETURNING.
+    """
+    tg_id = user_row["tg_id"]
+    uname = (username or "").lstrip("@")
+    usd = wd_row["amount_qc"] * 0.005  # 1 QC = $0.005
+
+    title = "💸 Нова заявка на вивід"  # або "Новая заявка на вывод"
+    # посилання працює навіть без username
+    contact = f"<a href='tg://user?id={tg_id}'>#{tg_id}</a>"
+    if uname:
+        contact += f" (@{uname})"
+
+    text = (
+        f"{title}\n\n"
+        f"ID заявки: <code>{wd_row['id']}</code>\n"
+        f"Користувач: {contact}\n"
+        f"Сума: <b>{wd_row['amount_qc']} QC</b> (~${usd:.2f})\n"
+        f"Країна: {wd_row['country']}\n"
+        f"Спосіб: {wd_row['method']}\n"
+        f"Реквізити: {wd_row['details']}\n"
+        f"Статус: pending"
+    )
+
+    for admin_id in settings.ADMIN_IDS:
+        try:
+            await bot.send_message(admin_id, text)
+        except Exception:
+            # ігноруємо одиничні фейли відправки, щоб не валити потік
+            pass
 
 def reset(uid: int):
     WState.stage.pop(uid, None)
@@ -110,16 +144,25 @@ async def w_amount(msg: Message):
     await msg.answer(confirm)
 
     # зберігаємо заявку
-    await fetchrow(
+    wd_row = await fetchrow(
         """
         INSERT INTO withdrawals (user_id, amount_qc, country, method, details)
         VALUES ((SELECT id FROM users WHERE tg_id=$1), $2, $3, $4, $5)
+        RETURNING id, amount_qc, country, method, details, status, created_at
         """,
         msg.from_user.id,
         val,
         d["country"],
         d["method"],
         d["details"],
+    )
+
+    # повідомляємо адмінів (без кнопок, просто повідомлення)
+    await notify_admins_withdrawal(
+        bot=msg.bot,
+        user_row=user,
+        wd_row=wd_row,
+        username=msg.from_user.username,
     )
 
     await msg.answer(i18n.t(lang, 'withdraw_saved'), reply_markup=ReplyKeyboardRemove())
