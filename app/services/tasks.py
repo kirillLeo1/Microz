@@ -1,220 +1,116 @@
 # app/services/tasks.py
 from __future__ import annotations
+from datetime import datetime, timezone, timedelta
+from collections import defaultdict
 
-from datetime import timedelta
-
-from sqlalchemy import select, func, update, and_, exists
+from sqlalchemy import select, update, func
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy.dialects.postgresql import insert as pg_insert  # для on_conflict_do_nothing
 
-from ..config import settings
-from ..utils import today_kyiv_bounds, now_utc
-from ..models import Tasks, UserTasks, QCWallets, TaskStatus
+from ..models import Tasks, UserTasks, QCWallets
 
+def now_utc() -> datetime:
+    return datetime.now(timezone.utc)
 
-async def completed_today(sess: AsyncSession, user_id: int) -> int:
-    """
-    Скільки завдань юзер завершив сьогодні (за Europe/Kyiv).
-    """
-    start, end = today_kyiv_bounds()
-    q = (
-        select(func.count())
-        .select_from(UserTasks)
-        .where(
-            and_(
-                UserTasks.user_id == user_id,
-                UserTasks.status == TaskStatus.completed,
-                UserTasks.completed_at >= start,
-                UserTasks.completed_at < end,
-            )
+async def daily_completed_count(sess: AsyncSession, user_id: int, tz_offset_minutes: int = 180) -> int:
+    """Скільки виконано сьогодні (доба по Києву, UTC+2/+3 = +180 хв як грубо)."""
+    # спростимо: віднімемо offset і порівняємо by date
+    base = now_utc() + timedelta(minutes=tz_offset_minutes)
+    day_start = datetime(base.year, base.month, base.day, tzinfo=base.tzinfo) - timedelta(minutes=tz_offset_minutes)
+    return (await sess.execute(
+        select(func.count(UserTasks.id)).where(
+            UserTasks.user_id==user_id,
+            UserTasks.status=="completed",
+            UserTasks.completed_at >= day_start
         )
-    )
-    return (await sess.execute(q)).scalar_one()
+    )).scalar_one()
 
-
-async def daily_limit_reached(sess: AsyncSession, user_id: int) -> bool:
+async def next_tasks_per_chain(sess: AsyncSession, user_id: int) -> list[tuple[str|None, Tasks, datetime|None]]:
     """
-    Перевірка денного ліміту (settings.DAILY_TASK_LIMIT).
+    Повертає список (chain_key, task, locked_until) — по ОДНОМУ «наступному» для кожного ланцюга.
+    Якщо зараз кулдаун — locked_until != None.
     """
-    return (await completed_today(sess, user_id)) >= settings.DAILY_TASK_LIMIT
+    # беремо всі активні таски
+    tasks = (await sess.execute(
+        select(Tasks).where(Tasks.is_active==True).order_by(Tasks.created_at.asc(), Tasks.id.asc())
+    )).scalars().all()
 
+    by_chain: dict[str|None, list[Tasks]] = defaultdict(list)
+    for t in tasks:
+        by_chain[t.chain_key].append(t)
 
-async def ensure_wallet(sess: AsyncSession, user_id: int) -> None:
-    """
-    Переконуємось, що гаманець існує (idempotent).
-    """
-    stmt = (
-        pg_insert(QCWallets)
-        .values(user_id=user_id, balance_qc=0, total_earned_qc=0)
-        .on_conflict_do_nothing(index_elements=[QCWallets.user_id])
-    )
-    await sess.execute(stmt)
+    results: list[tuple[str|None, Tasks, datetime|None]] = []
+    for chain_key, arr in by_chain.items():
+        # скільки вже виконано кроків у цьому ланцюгу
+        done_cnt = (await sess.execute(
+            select(func.count(UserTasks.id))
+            .join(Tasks, Tasks.id==UserTasks.task_id)
+            .where(UserTasks.user_id==user_id, UserTasks.status=="completed", Tasks.chain_key==chain_key)
+        )).scalar_one()
+        if done_cnt >= len(arr):
+            continue  # ланцюг завершено
 
+        candidate = arr[done_cnt]  # наступний крок
+        ut = (await sess.execute(
+            select(UserTasks).where(UserTasks.user_id==user_id, UserTasks.task_id==candidate.id)
+        )).scalar_one_or_none()
 
-async def get_pending_available(sess: AsyncSession, user_id: int):
-    """
-    Повертає перший доступний pending-таск для користувача.
-    """
-    q = (
-        select(Tasks, UserTasks)
-        .join(UserTasks, UserTasks.task_id == Tasks.id)
-        .where(
-            and_(
-                UserTasks.user_id == user_id,
-                UserTasks.status == TaskStatus.pending,
-                (UserTasks.available_at.is_(None)) | (UserTasks.available_at <= now_utc()),
-                Tasks.is_active.is_(True),
-            )
-        )
-        .order_by(Tasks.created_at.asc())
-        .limit(1)
-    )
-    return (await sess.execute(q)).first()
-
-
-async def assign_first_in_chain(sess: AsyncSession, user_id: int):
-    """
-    Призначає користувачу перший підходящий таск:
-    - якщо chain_key: одночасно на юзера 1 pending у цьому chain;
-    - якщо одиночний: призначаємо, якщо ще не призначали.
-    """
-    t = Tasks
-    ut = UserTasks
-
-    rows = (
-        await sess.execute(select(t).where(t.is_active.is_(True)).order_by(t.created_at.asc()))
-    ).scalars().all()
-
-    for task in rows:
-        if task.chain_key:
-            # Чи є вже pending у цьому chain?
-            has_pending_in_chain = (
-                await sess.execute(
-                    select(
-                        exists().where(
-                            and_(
-                                ut.user_id == user_id,
-                                ut.status == TaskStatus.pending,
-                                exists(
-                                    select(Tasks.id).where(and_(Tasks.id == ut.task_id, Tasks.chain_key == task.chain_key))
-                                ),
-                            )
-                        )
-                    )
-                )
-            ).scalar()
-
-            if has_pending_in_chain:
-                continue
-
-            # Чи вже призначали саме цей таск?
-            already_assigned = (
-                await sess.execute(select(exists().where(and_(ut.user_id == user_id, ut.task_id == task.id))))
-            ).scalar()
-            if already_assigned:
-                continue
-
-            await sess.execute(
-                pg_insert(ut)
-                .values(user_id=user_id, task_id=task.id, status=TaskStatus.pending, available_at=now_utc())
-                .on_conflict_do_nothing(index_elements=[ut.user_id, ut.task_id])
-            )
-            return task
+        if ut and ut.status=="pending" and ut.available_at and ut.available_at > now_utc():
+            # кулдаун — ще не можна
+            results.append((chain_key, candidate, ut.available_at))
         else:
-            # Одиночний
-            already_assigned = (
-                await sess.execute(select(exists().where(and_(ut.user_id == user_id, ut.task_id == task.id))))
-            ).scalar()
-            if not already_assigned:
-                await sess.execute(
-                    pg_insert(ut)
-                    .values(user_id=user_id, task_id=task.id, status=TaskStatus.pending, available_at=now_utc())
-                    .on_conflict_do_nothing(index_elements=[ut.user_id, ut.task_id])
-                )
-                return task
+            # доступно зараз
+            results.append((chain_key, candidate, None))
 
-    return None
-
-
-async def next_task_for_user(sess: AsyncSession, user_id: int):
-    """
-    Головний «видавач» задач:
-    1) якщо денний ліміт — повертаємо (None, "limit");
-    2) якщо є доступний pending — повертаємо його;
-    3) інакше намагаємось щось призначити (chain-aware).
-    """
-    if await daily_limit_reached(sess, user_id):
-        return None, "limit"
-
-    row = await get_pending_available(sess, user_id)
-    if row:
-        task, _ = row
-        return task, None
-
-    t = await assign_first_in_chain(sess, user_id)
-    return (t, None) if t else (None, None)
-
+    return results
 
 async def complete_task(sess: AsyncSession, user_id: int, task_id: int) -> None:
-    """
-    Позначаємо таск як виконаний, нараховуємо 1 QC, і якщо це chain —
-    призначаємо наступну копію з cooldown.
-    """
-    await ensure_wallet(sess, user_id)
+    """Позначає task виконаним, нараховує reward, створює pending для наступного з кулдауном."""
+    task = (await sess.execute(select(Tasks).where(Tasks.id==task_id))).scalar_one()
+    now = now_utc()
 
-    # Позначити completed (тільки якщо був pending)
-    await sess.execute(
-        update(UserTasks)
-        .where(
-            and_(
-                UserTasks.user_id == user_id,
-                UserTasks.task_id == task_id,
-                UserTasks.status == TaskStatus.pending,
-            )
+    ut = (await sess.execute(
+        select(UserTasks).where(UserTasks.user_id==user_id, UserTasks.task_id==task_id)
+    )).scalar_one_or_none()
+
+    if ut and ut.status=="completed":
+        return  # вже виконаний
+
+    if ut:
+        await sess.execute(
+            update(UserTasks).where(UserTasks.id==ut.id).values(status="completed", completed_at=now)
         )
-        .values(status=TaskStatus.completed, completed_at=now_utc())
-    )
+    else:
+        sess.add(UserTasks(user_id=user_id, task_id=task_id, status="completed", completed_at=now))
 
-    # Дістати таск та нарахувати QC
-    task = (await sess.execute(select(Tasks).where(Tasks.id == task_id))).scalar_one()
+    # нараховуємо нагороду
     await sess.execute(
         update(QCWallets)
-        .where(QCWallets.user_id == user_id)
-        .values(
-            balance_qc=QCWallets.balance_qc + task.reward_qc,
-            total_earned_qc=QCWallets.total_earned_qc + task.reward_qc,
-        )
+        .where(QCWallets.user_id==user_id)
+        .values(balance_qc=QCWallets.balance_qc + task.reward_qc,
+                total_earned_qc=QCWallets.total_earned_qc + task.reward_qc)
     )
 
-    # Якщо є ланцюг — призначити наступну копію з cooldown
-    if task.chain_key and task.cooldown_sec > 0:
-        nxt = (
-            await sess.execute(
-                select(Tasks)
-                .where(
-                    and_(
-                        Tasks.chain_key == task.chain_key,
-                        Tasks.is_active.is_(True),
-                        ~exists(
-                            select(UserTasks.id).where(
-                                and_(UserTasks.user_id == user_id, UserTasks.task_id == Tasks.id)
-                            )
-                        ),
-                    )
+    # створюємо pending-замок для наступного кроку (кулдаун)
+    if task.chain_key is not None:
+        # всі кроки цього ланцюга у порядку
+        steps = (await sess.execute(
+            select(Tasks).where(Tasks.chain_key==task.chain_key, Tasks.is_active==True).order_by(Tasks.created_at.asc(), Tasks.id.asc())
+        )).scalars().all()
+        try:
+            idx = [t.id for t in steps].index(task_id)
+        except ValueError:
+            idx = -1
+        if idx != -1 and idx+1 < len(steps):
+            next_task = steps[idx+1]
+            lock_until = now + timedelta(seconds=task.cooldown_sec or 0)
+            exists = (await sess.execute(
+                select(UserTasks).where(UserTasks.user_id==user_id, UserTasks.task_id==next_task.id)
+            )).scalar_one_or_none()
+            if not exists:
+                sess.add(UserTasks(
+                    user_id=user_id, task_id=next_task.id, status="pending", available_at=lock_until
+                ))
+            else:
+                await sess.execute(
+                    update(UserTasks).where(UserTasks.id==exists.id).values(status="pending", available_at=lock_until)
                 )
-                .order_by(Tasks.created_at.asc())
-                .limit(1)
-            )
-        ).scalar()
-
-        if nxt:
-            await sess.execute(
-                pg_insert(UserTasks)
-                .values(
-                    user_id=user_id,
-                    task_id=nxt.id,
-                    status=TaskStatus.pending,
-                    available_at=now_utc() + timedelta(seconds=task.cooldown_sec),
-                )
-                .on_conflict_do_nothing(index_elements=[UserTasks.user_id, UserTasks.task_id])
-            )
