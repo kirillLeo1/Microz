@@ -14,7 +14,7 @@ class Settings(BaseSettings):
     DAILY_TASK_LIMIT: int = 10
     RESET_TZ: str = "Europe/Kyiv"
     TECH_CHAT_ID: int | None = None
-
+    DEV_FAKE_PAY: bool = False
     class Config:
         env_file = ".env"
         extra = "ignore"
