@@ -1,4 +1,4 @@
-from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
+from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton, ReplyKeyboardMarkup
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 
 def lang_kb():
@@ -33,7 +33,19 @@ def step_kb(open_url: str, check_text: str, open_text: str, step_id: int, chain_
     kb.row(InlineKeyboardButton(text=open_text, url=open_url))
     kb.row(InlineKeyboardButton(text=check_text, callback_data=f"step_check:{step_id}:{chain_id}"))
     return kb.as_markup()
-
+    
+def main_menu_kb(texts: dict) -> ReplyKeyboardMarkup:
+    """
+    Reply-клава головного меню. texts — це i18n._texts[lang].
+    """
+    return ReplyKeyboardMarkup(
+        keyboard=[
+            [KeyboardButton(text=texts["tasks_btn"])],
+            [KeyboardButton(text=texts["profile_btn"])],
+            [KeyboardButton(text=texts["withdraw_btn"])],
+        ],
+        resize_keyboard=True
+    )
 
 def admin_menu_kb(texts):
     kb = InlineKeyboardBuilder()
