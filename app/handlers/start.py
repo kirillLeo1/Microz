@@ -8,7 +8,7 @@ from ..config import settings
 from ..utils.payments import create_invoice, get_invoices_info
 from ..db import fetchrow
 from ..services.tasks_service import create_invoice as db_create_invoice, set_payment_status
-
+from ..utils.tg import replace_message
 router = Router()
 
 def parse_ref(payload: str | None) -> int | None:
@@ -48,7 +48,12 @@ async def set_lang(cb: CallbackQuery):
     code = cb.data.split(":")[1]
     await set_language(cb.from_user.id, code)
     texts = i18n._texts[code]
-    await cb.message.edit_text(f"<b>{texts['activate_title']}</b>\n{texts['activate_text']}")
+    await replace_message(
+        cb.message,
+        f"<b>{texts['activate_title']}</b>\n{texts['activate_text']}",
+        reply_markup=kb,
+    )
+    await cb.answer()
     # Create invoice
     if settings.TEST_MODE:
         pay_url = None
@@ -68,7 +73,6 @@ async def set_lang(cb: CallbackQuery):
             await db_create_invoice(user["id"], uuid, link, settings.CRYPTOCLOUD_PRICE_USD)
         pay_url = link
     kb = activation_kb(pay_url, texts)
-    await cb.message.edit_reply_markup(reply_markup=kb)
     await cb.answer()
 
 @router.callback_query(F.data=="paid_check")
@@ -79,8 +83,9 @@ async def on_paid(cb: CallbackQuery):
     if settings.TEST_MODE:
         await activate_user(cb.from_user.id)
         await award_referral_if_needed(cb.from_user.id)
-        await cb.message.edit_text(texts["activated"])
+        await replace_message(cb.message, texts["activated"])
         await cb.answer()
+
         return
     inv = await fetchrow("SELECT * FROM payments WHERE user_id=$1 ORDER BY id DESC LIMIT 1", user["id"])
     if not inv:
@@ -99,6 +104,6 @@ async def on_paid(cb: CallbackQuery):
         await set_payment_status(inv["uuid"], status)
         await activate_user(cb.from_user.id)
         await award_referral_if_needed(cb.from_user.id)
-        await cb.message.edit_text(texts["activated"])
+        await replace_message(cb.message, texts["activated"])
     else:
         await cb.answer(texts["not_confirmed"], show_alert=True)
