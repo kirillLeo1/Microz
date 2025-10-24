@@ -122,6 +122,6 @@ async def w_amount(msg: Message):
         d["details"],
     )
 
-    await msg.answer(i18n.t(lang, "withdraw_saved"))
+    await msg.answer(i18n.t(lang, 'withdraw_saved'), reply_markup=ReplyKeyboardRemove())
     reset(msg.from_user.id)
 
