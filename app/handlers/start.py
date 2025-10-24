@@ -2,7 +2,7 @@ from aiogram import Router, F
 from aiogram.types import Message, CallbackQuery
 from aiogram.filters import CommandStart, Command
 from ..utils.i18n import i18n
-from ..utils.keyboards import lang_kb, activation_kb
+from ..utils.keyboards import lang_kb, activation_kb, main_menu_kb
 from ..services.tasks_service import ensure_user, set_language, get_user, award_referral_if_needed, activate_user
 from ..config import settings
 from ..utils.payments import create_invoice, get_invoices_info
@@ -27,23 +27,40 @@ def parse_ref(payload: str | None) -> int | None:
 
 @router.message(CommandStart())
 async def on_start(msg: Message):
-    ref = parse_ref(msg.text.split(maxsplit=1)[1] if len(msg.text.split())>1 else None)
+    # 1) фіксуємо можливого реферала
+    payload = msg.text.split(maxsplit=1)[1] if msg.text and len(msg.text.split()) > 1 else None
+    ref = parse_ref(payload)
     user = await ensure_user(msg.from_user.id, referrer_tg=ref)
+
+    # 2) немає мови → показуємо вибір (інлайни), попередньо скидаємо reply-клаву
     if not user["language"]:
-        await msg.answer(i18n.t("en","lang_prompt"), reply_markup=lang_kb())
+        await msg.answer(" ", reply_markup=ReplyKeyboardRemove())
+        await msg.answer(i18n.t("en", "lang_prompt"), reply_markup=lang_kb())
         return
-    # If inactive — show activation
+
+    # 3) якщо не активний → екран активації з кнопкою "Оплатити $1" (якщо інвойс вже є)
     if user["status"] != "active":
         lang = user["language"]
         texts = i18n._texts[lang]
-        # create invoice if none exists in 'created' for this user
-        inv = await fetchrow("SELECT * FROM payments WHERE user_id=$1 AND status='created' ORDER BY id DESC LIMIT 1", user["id"])
+
+        inv = await fetchrow(
+            "SELECT link FROM payments WHERE user_id=$1 AND status='created' ORDER BY id DESC LIMIT 1",
+            user["id"],
+        )
         pay_url = inv["link"] if inv else None
-        await msg.answer(f"<b>{texts['activate_title']}</b>\n{texts['activate_text']}", reply_markup=activation_kb(pay_url, texts))
+
+        # прибираємо залиплу reply-клаву й показуємо інлайн-кнопки активації
+        await msg.answer(" ", reply_markup=ReplyKeyboardRemove())
+        await msg.answer(
+            f"<b>{texts['activate_title']}</b>\n{texts['activate_text']}",
+            reply_markup=activation_kb(pay_url, texts),
+        )
         return
-    # Main menu
-    lang = user['language']
-    await msg.answer(i18n.t(lang, 'main_menu'), reply_markup=ReplyKeyboardRemove())
+
+    # 4) активний → показуємо ГОЛОВНЕ МЕНЮ з reply-клавою
+    lang = user["language"]
+    texts = i18n._texts[lang]
+    await msg.answer(texts["main_menu"], reply_markup=main_menu_kb(texts))
 
 
 @router.callback_query(F.data.startswith("lang:"))
@@ -91,35 +108,38 @@ async def set_lang(cb: CallbackQuery):
     await cb.answer()
 
 
-@router.callback_query(F.data=="paid_check")
+@router.callback_query(F.data=='paid_check')
 async def on_paid(cb: CallbackQuery):
     user = await get_user(cb.from_user.id)
-    lang = user["language"] or "en"
+    lang = user['language'] or 'en'
     texts = i18n._texts[lang]
+
     if settings.TEST_MODE:
         await activate_user(cb.from_user.id)
         await award_referral_if_needed(cb.from_user.id)
-        await replace_message(cb.message, texts["activated"])
+        await replace_message(cb.message, texts['activated'])
+        # показуємо меню
+        await cb.message.answer(texts['main_menu'], reply_markup=main_menu_kb(texts))
         await cb.answer()
-
         return
+
     inv = await fetchrow("SELECT * FROM payments WHERE user_id=$1 ORDER BY id DESC LIMIT 1", user["id"])
     if not inv:
         await cb.answer("No invoice.")
         return
-    data = await get_invoices_info([inv["uuid"]])
-    # The response typically contains a list of invoices with statuses
-    # Normalize
+
+    data = await get_invoices_info([inv['uuid']])
     status = None
-    if isinstance(data, dict):
-        items = data.get("result") or data.get("invoices") or data.get("data") or []
-        if isinstance(items, list) and items:
-            it = items[0]
-            status = it.get("status") or it.get("status_invoice")
-    if status in ("paid","overpaid","partial"):
-        await set_payment_status(inv["uuid"], status)
+    if isinstance(data, list) and data:
+        status = data[0].get('status') or data[0].get('status_invoice')
+
+    if status in ('paid','overpaid','partial'):
+        await set_payment_status(inv['uuid'], status)
         await activate_user(cb.from_user.id)
         await award_referral_if_needed(cb.from_user.id)
-        await replace_message(cb.message, texts["activated"])
+        await replace_message(cb.message, texts['activated'])
+        # меню після активації
+        await cb.message.answer(texts['main_menu'], reply_markup=main_menu_kb(texts))
     else:
-        await cb.answer(texts["not_confirmed"], show_alert=True)
+        await cb.answer(texts['not_confirmed'], show_alert=True)
+
