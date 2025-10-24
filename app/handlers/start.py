@@ -45,34 +45,41 @@ async def on_start(msg: Message):
 
 @router.callback_query(F.data.startswith("lang:"))
 async def set_lang(cb: CallbackQuery):
-    code = cb.data.split(":")[1]
+    """
+    Обробка вибору мови:
+    - зберігаємо мову
+    - створюємо інвойс у CryptoCloud (якщо не TEST_MODE)
+    - показуємо екран активації з кнопкою “Оплатити $1” (або без, якщо створення інвойса не вдалося)
+    """
+    code = cb.data.split(":")[1].strip()
     await set_language(cb.from_user.id, code)
-    texts = i18n._texts[code]
-    await replace_message(
-        cb.message,
-        f"<b>{texts['activate_title']}</b>\n{texts['activate_text']}",
-        reply_markup=kb,
-    )
-    await cb.answer()
-    # Create invoice
-    if settings.TEST_MODE:
-        pay_url = None
-    else:
-        user = await get_user(cb.from_user.id)
-        data = await create_invoice(
-            amount_usd=settings.CRYPTOCLOUD_PRICE_USD,
-            order_id=f"ACT-{user['tg_id']}",
-            description="Activation",
-            locale=code
-        )
-        # data may include fields like {status, result: {link,uuid,...}} depending on CC
-        result = data.get("result") or data
-        uuid = result.get("uuid") or result.get("invoice","")
-        link = result.get("link") or result.get("pay_url") or result.get("url")
-        if uuid and link:
-            await db_create_invoice(user["id"], uuid, link, settings.CRYPTOCLOUD_PRICE_USD)
-        pay_url = link
+
+    texts = i18n._texts.get(code, i18n._texts["en"])
+    pay_url = None
+
+    if not settings.TEST_MODE:
+        try:
+            user = await get_user(cb.from_user.id)
+            inv = await create_invoice(
+                amount_usd=settings.CRYPTOCLOUD_PRICE_USD,
+                order_id=f"ACT-{user['tg_id']}",
+                description="Activation",
+                locale=code,
+            )
+            # inv = {"uuid": "...", "link": "https://pay.cryptocloud.plus/invoice/...."}
+            await db_create_invoice(user["id"], inv["uuid"], inv["link"], settings.CRYPTOCLOUD_PRICE_USD)
+            pay_url = inv["link"]
+        except CryptoCloudError as e:
+            # Показуємо юзеру коротке пояснення, а ти деталі побачиш у логах
+            await cb.message.answer(f"❗️Не вдалось створити інвойс: {e}")
+        except Exception as e:
+            await cb.message.answer(f"❗️Помилка створення інвойса. Спробуйте ще раз пізніше.")
+
+    text = f"<b>{texts['activate_title']}</b>\n{texts['activate_text']}"
     kb = activation_kb(pay_url, texts)
+
+    # Замість edit_* — видаляємо старе і шлемо нове (анти 'message is not modified')
+    await replace_message(cb.message, text, reply_markup=kb)
     await cb.answer()
 
 @router.callback_query(F.data=="paid_check")
