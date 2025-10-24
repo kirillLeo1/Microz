@@ -49,7 +49,11 @@ async def open_chain(cb: CallbackQuery):
     reward = st["reward_qc"]
     text = (f"<b>{title}</b>\n" if title and title!="-"
             else "") + f"{desc}\n\n" + i18n.t(lang,"reward", qc=reward)
-    await cb.message.edit_text(text, reply_markup=step_kb(st["url"], i18n.t(lang,"check_btn"), i18n.t(lang,"open_btn")))
+    await cb.message.edit_text(
+        text,
+        reply_markup=step_kb(st["url"], i18n.t(lang,"check_btn"), i18n.t(lang,"open_btn"), st["id"], int(chain_id))
+    )
+
     # Store context for "step_check":
 
 @router.callback_query(F.data=="step_check")
