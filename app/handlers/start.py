@@ -10,7 +10,12 @@ from ..db import fetchrow
 from ..services.tasks_service import create_invoice as db_create_invoice, set_payment_status
 from ..utils.tg import replace_message
 from aiogram.types import ReplyKeyboardRemove
+import time
 router = Router()
+
+_last_start = {}  # user_id -> ts
+
+DEBOUNCE_SEC = 1.2
 
 def parse_ref(payload: str | None) -> int | None:
     if not payload:
@@ -27,6 +32,12 @@ def parse_ref(payload: str | None) -> int | None:
 
 @router.message(CommandStart())
 async def on_start(msg: Message):
+    now = time.time()
+    ts = _last_start.get(msg.from_user.id, 0)
+    if now - ts < DEBOUNCE_SEC:
+        return  # ігноруємо дубльований /start
+    _last_start[msg.from_user.id] = now
+
     # 1) фіксуємо можливого реферала
     payload = msg.text.split(maxsplit=1)[1] if msg.text and len(msg.text.split()) > 1 else None
     ref = parse_ref(payload)
@@ -34,7 +45,7 @@ async def on_start(msg: Message):
 
     # 2) немає мови → показуємо вибір (інлайни), попередньо скидаємо reply-клаву
     if not user["language"]:
-        await msg.answer(" ", reply_markup=ReplyKeyboardRemove())
+        await msg.answer("\u2063", reply_markup=ReplyKeyboardRemove())
         await msg.answer(i18n.t("en", "lang_prompt"), reply_markup=lang_kb())
         return
 
@@ -50,7 +61,7 @@ async def on_start(msg: Message):
         pay_url = inv["link"] if inv else None
 
         # прибираємо залиплу reply-клаву й показуємо інлайн-кнопки активації
-        await msg.answer(" ", reply_markup=ReplyKeyboardRemove())
+        await msg.answer("\u2063", reply_markup=ReplyKeyboardRemove())
         await msg.answer(
             f"<b>{texts['activate_title']}</b>\n{texts['activate_text']}",
             reply_markup=activation_kb(pay_url, texts),
@@ -99,7 +110,7 @@ async def set_lang(cb: CallbackQuery):
     kb = activation_kb(pay_url, texts)
 
     # 1) скидаємо reply-клавіатуру (це окреме повідомлення)
-    await cb.message.answer(" ", reply_markup=ReplyKeyboardRemove())
+    await cb.message.answer("\u2063", reply_markup=ReplyKeyboardRemove())
 
     # 2) показуємо екран активації: delete + send (інлайн-кнопки всередині)
     await replace_message(cb.message, text, reply_markup=kb)
