@@ -9,14 +9,29 @@ KYIV = ZoneInfo(settings.TZ_KYIV)
 DAILY_LIMIT = 10
 CHAIN_COOLDOWN = timedelta(minutes=30)
 
-async def ensure_user(tg_id: int, referrer_tg: Optional[int] = None):
+async def ensure_user(tg_id: int, referrer_tg: int | None = None):
+    # 1) вже існує — віддаємо як є
     row = await fetchrow("SELECT * FROM users WHERE tg_id=$1", tg_id)
     if row:
         return row
+
+    # 2) знаходимо реферера (якщо він є і це не self)
     ref_id = None
     if referrer_tg and referrer_tg != tg_id:
         ref_id = await fetchval("SELECT id FROM users WHERE tg_id=$1", referrer_tg)
-    await fetchrow("INSERT INTO users (tg_id, referrer_id) VALUES ($1,$2) RETURNING id", tg_id, ref_id)
+
+    # 3) Акуратне вставлення: якщо запис уже створився паралельно, просто ігноруємо
+    await execute(
+        """
+        INSERT INTO users (tg_id, referrer_id)
+        VALUES ($1, $2)
+        ON CONFLICT (tg_id) DO NOTHING
+        """,
+        tg_id,
+        ref_id,
+    )
+
+    # 4) Повертаємо актуальний запис
     return await fetchrow("SELECT * FROM users WHERE tg_id=$1", tg_id)
 
 async def set_language(tg_id: int, lang: str):
