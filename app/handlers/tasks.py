@@ -9,6 +9,7 @@ from aiogram.exceptions import TelegramBadRequest
 from ..utils.tg import replace_message
 from ..utils.keyboards import step_check_kb
 from ..utils.links import normalize_url
+from ..db import fetchrow
 router = Router()
 
 @router.message(F.text.in_({"🎯 Завдання","🎯 Задания","🎯 Tasks"}))
@@ -40,11 +41,6 @@ async def open_tasks(msg: Message):
 
 @router.callback_query(F.data.startswith("open_chain:"))
 async def open_chain(cb: CallbackQuery):
-    """
-    Очікує callback_data формату: open_chain:<chain_id>:<step_id>
-    Показує опис кроку + КЛІКАБЕЛЬНИЙ ЛІНК у тексті, без кнопки-url.
-    В клавіатурі лишається тільки кнопка 'Перевірити'.
-    """
     try:
         _, chain_id, step_id = cb.data.split(":")
         chain_id = int(chain_id)
@@ -66,7 +62,6 @@ async def open_chain(cb: CallbackQuery):
     reward = st["reward_qc"]
     open_url = normalize_url(st["url"])
 
-    # Текст кроку: (заголовок — опційно) + опис + кликабельный лінк + нагорода
     parts = []
     if title and title != "-":
         parts.append(f"<b>{title}</b>")
