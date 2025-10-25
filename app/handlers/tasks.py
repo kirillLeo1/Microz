@@ -7,7 +7,8 @@ from ..services.tasks_service import (get_user, list_chains, list_chain_steps, u
                                       award_qc, mark_step_completed)
 from aiogram.exceptions import TelegramBadRequest
 from ..utils.tg import replace_message
-
+from ..utils.keyboards import step_check_kb
+from ..utils.links import normalize_url
 router = Router()
 
 @router.message(F.text.in_({"🎯 Завдання","🎯 Задания","🎯 Tasks"}))
@@ -39,22 +40,48 @@ async def open_tasks(msg: Message):
 
 @router.callback_query(F.data.startswith("open_chain:"))
 async def open_chain(cb: CallbackQuery):
-    _, chain_id, step_id = cb.data.split(":")
+    """
+    Очікує callback_data формату: open_chain:<chain_id>:<step_id>
+    Показує опис кроку + КЛІКАБЕЛЬНИЙ ЛІНК у тексті, без кнопки-url.
+    В клавіатурі лишається тільки кнопка 'Перевірити'.
+    """
+    try:
+        _, chain_id, step_id = cb.data.split(":")
+        chain_id = int(chain_id)
+        step_id = int(step_id)
+    except Exception:
+        await cb.answer("Bad data", show_alert=True)
+        return
+
     user = await get_user(cb.from_user.id)
-    lang = user["language"]
-    # load step
-    from ..db import fetchrow
-    st = await fetchrow("SELECT * FROM steps WHERE id=$1", int(step_id))
-    title = st[f"title_{lang}"] or ""
-    desc = st[f"desc_{lang}"] or ""
+    lang = (user and user.get("language")) or "en"
+
+    st = await fetchrow("SELECT * FROM steps WHERE id=$1", step_id)
+    if not st:
+        await cb.answer(i18n.t(lang, "not_found"), show_alert=True)
+        return
+
+    title = st.get(f"title_{lang}") or ""
+    desc = st.get(f"desc_{lang}") or ""
     reward = st["reward_qc"]
-    text = (f"<b>{title}</b>\n" if title and title!="-"
-            else "") + f"{desc}\n\n" + i18n.t(lang,"reward", qc=reward)
+    open_url = normalize_url(st["url"])
+
+    # Текст кроку: (заголовок — опційно) + опис + кликабельный лінк + нагорода
+    parts = []
+    if title and title != "-":
+        parts.append(f"<b>{title}</b>")
+    if desc:
+        parts.append(desc)
+    parts.append(f"🔗 {open_url}")
+    parts.append(i18n.t(lang, "reward", qc=reward))
+    text = "\n\n".join(parts)
+
     await replace_message(
         cb.message,
         text,
-        reply_markup=step_kb(st["url"], i18n.t(lang,"check_btn"), i18n.t(lang,"open_btn"), st["id"], int(chain_id))
+        reply_markup=step_check_kb(i18n.t(lang, "check_btn"), step_id, chain_id),
     )
+    await cb.answer()
 
     # Store context for "step_check":
 
