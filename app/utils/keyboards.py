@@ -58,3 +58,13 @@ def admin_menu_kb(texts):
         InlineKeyboardButton(text=texts["admin_withdraws"], callback_data="admin:withdraws"),
     )
     return kb.as_markup()
+
+def step_check_kb(check_text: str, step_id: int, chain_id: int):
+    kb = InlineKeyboardBuilder()
+    kb.row(
+        InlineKeyboardButton(
+            text=check_text,
+            callback_data=f"step_check:{step_id}:{chain_id}"
+        )
+    )
+    return kb.as_markup()
