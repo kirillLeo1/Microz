@@ -7,3 +7,5 @@ python-dotenv==1.0.1
 Babel==2.14.0
 tzdata==2024.2
 uvicorn==0.30.6
+ecdsa>=0.18
+
