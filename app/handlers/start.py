@@ -11,6 +11,8 @@ from ..services.tasks_service import create_invoice as db_create_invoice, set_pa
 from ..utils.tg import replace_message
 from aiogram.types import ReplyKeyboardRemove
 import time
+from aiogram.types import PreCheckoutQuery
+from aiogram.types import LabeledPrice
 router = Router()
 
 _last_start = {}  # user_id -> ts
@@ -73,50 +75,142 @@ async def on_start(msg: Message):
     texts = i18n._texts[lang]
     await msg.answer(texts["main_menu"], reply_markup=main_menu_kb(texts))
 
+@router.callback_query(F.data == "pay:stars")
+async def pay_stars(cb: CallbackQuery):
+    user = await get_user(cb.from_user.id)
+    payload = f"ACT-STAR:{user['tg_id']}:{int(time.time())}"  # наш order_id
+
+    await cb.message.bot.send_invoice(
+        chat_id=cb.from_user.id,
+        title=settings.STARS_TITLE,
+        description=settings.STARS_DESCRIPTION,
+        payload=payload,
+        currency="XTR",                                   # Telegram Stars
+        prices=[LabeledPrice(label=settings.STARS_TITLE, amount=int(settings.STARS_PRICE_XTR))],
+        provider_token="",                                # для XTR не потрібен
+    )
+    await cb.answer()
+
+@router.pre_checkout_query()
+async def on_pre_checkout(pcq: PreCheckoutQuery):
+    # можеш перевірити pcq.currency == "XTR" і payload починається з ACT-STAR:
+    await pcq.answer(ok=True)
 
 @router.callback_query(F.data.startswith("lang:"))
 async def set_lang(cb: CallbackQuery):
-    """
-    Обробка вибору мови:
-    - зберігаємо мову
-    - створюємо інвойс у CryptoCloud (якщо не TEST_MODE)
-    - показуємо екран активації з кнопкою “Оплатити $1” (або без, якщо створення інвойса не вдалося)
-    """
-    code = cb.data.split(":")[1].strip()
-    await set_language(cb.from_user.id, code)
+    code = cb.data.split(":")[1]
+    user = await ensure_user(cb.from_user.id, referrer_tg_id=None)  # або твій get_user + set_language
+    # збережи мову (як у тебе реалізовано)
+    # await set_language(user["id"], code)
 
-    texts = i18n._texts.get(code, i18n._texts["en"])
-    pay_url = None
+    texts = i18n._texts[code]
+    pay_url_crypto = None
 
     if not settings.TEST_MODE:
-        try:
-            user = await get_user(cb.from_user.id)
-            inv = await create_invoice(
-                amount_usd=settings.CRYPTOCLOUD_PRICE_USD,
-                order_id=f"ACT-{user['tg_id']}",
-                description="Activation",
-                locale=code,
-            )
-            # inv = {"uuid": "...", "link": "https://pay.cryptocloud.plus/invoice/...."}
-            await db_create_invoice(user["id"], inv["uuid"], inv["link"], settings.CRYPTOCLOUD_PRICE_USD)
-            pay_url = inv["link"]
-        except CryptoCloudError as e:
-            # Показуємо юзеру коротке пояснення, а ти деталі побачиш у логах
-            await cb.message.answer(f"❗️Не вдалось створити інвойс: {e}")
-        except Exception as e:
-            await cb.message.answer(f"❗️Помилка створення інвойса. Спробуйте ще раз пізніше.")
+        # --- створюємо CC-інвойс (як робив раніше), і кладемо в payments
+        inv = await cc_create(
+            amount_usd=settings.CRYPTOCLOUD_PRICE_USD,
+            order_id=f"ACT-CC-{user['tg_id']}",
+            description="Activation",
+            locale=code,
+        )
+        cc_uuid = inv["uuid"]
+        cc_link = inv["link"]
+        pay_url_crypto = cc_link
 
-    text = f"<b>{texts['activate_title']}</b>\n{texts['activate_text']}"
-    kb = activation_kb(pay_url, texts)
+        await execute("""
+            INSERT INTO payments (user_id, provider, uuid, link, status, amount_usd, currency)
+            VALUES ($1,'cryptocloud',$2,$3,'created',$4,'USD')
+        """, user["id"], cc_uuid, cc_link, settings.CRYPTOCLOUD_PRICE_USD)
 
-    # 1) скидаємо reply-клавіатуру (це окреме повідомлення)
+    # чисто скинути reply-клаву, потім показати екран
     await cb.message.answer("\u2063", reply_markup=ReplyKeyboardRemove())
-
-    # 2) показуємо екран активації: delete + send (інлайн-кнопки всередині)
-    await replace_message(cb.message, text, reply_markup=kb)
-    
-    # 3) закриваємо callback
+    await replace_message(
+        cb.message,
+        f"<b>{texts['activate_title']}</b>\n\n{texts['activate_text']}",
+        reply_markup=activation_kb(pay_url_crypto, texts, include_stars=settings.STARS_ENABLED),
+    )
     await cb.answer()
+
+@router.message(F.successful_payment)
+async def on_successful_payment(msg: Message):
+    sp = msg.successful_payment
+    if sp.currency != "XTR":
+        return
+    payload = sp.invoice_payload or ""
+    if not payload.startswith("ACT-STAR:"):
+        return
+
+    user = await get_user(msg.from_user.id)
+
+    # зафіксувати платіж Stars (ідемпотентно)
+    await execute("""
+        INSERT INTO payments (user_id, provider, order_id, status, currency, amount_stars)
+        VALUES ($1,'stars',$2,'paid','XTR',$3)
+        ON CONFLICT (provider, order_id)
+        DO UPDATE SET status='paid', amount_stars=EXCLUDED.amount_stars
+    """, user["id"], payload, sp.total_amount)
+
+    # активуємо акаунт + одноразовий реф-бонус
+    await execute("UPDATE users SET status='active' WHERE id=$1", user["id"])
+    await execute("""
+        UPDATE users u SET earned_total_qc = earned_total_qc + 60
+        FROM users r
+        WHERE r.id = $1 AND r.referrer_id = u.id
+          AND r.referral_bonus_given IS DISTINCT FROM TRUE
+    """, user["id"])
+    await execute("UPDATE users SET referral_bonus_given=TRUE WHERE id=$1", user["id"])
+
+    texts = i18n._texts[user["language"]]
+    await msg.answer(texts["activated"])
+    await msg.answer(texts["main_menu"], reply_markup=main_menu_kb(texts))
+
+@router.callback_query(F.data == "activation:check")
+async def activation_check(cb: CallbackQuery):
+    user = await get_user(cb.from_user.id)
+    if user["status"] == "active":
+        await cb.answer("Вже активовано ✅", show_alert=True)
+        return
+
+    ok = False
+
+    # 1) Раптом вже прийшов successful_payment (Stars)
+    row_star = await fetchrow("""
+        SELECT 1 FROM payments
+         WHERE user_id=$1 AND provider='stars' AND status='paid'
+         ORDER BY id DESC LIMIT 1
+    """, user["id"])
+    if row_star:
+        ok = True
+
+    # 2) Якщо ні — перевіряємо CryptoCloud
+    if not ok:
+        inv = await fetchrow("""
+            SELECT uuid FROM payments
+             WHERE user_id=$1 AND provider='cryptocloud' AND status='created'
+             ORDER BY id DESC LIMIT 1
+        """, user["id"])
+        if inv and inv["uuid"]:
+            try:
+                info = await get_invoices_info([inv["uuid"]])   # список інвойсів
+                status = (info[0].get("status") or "").lower() if info else ""
+                if status in ("paid", "overpaid", "partial"):
+                    ok = True
+                    await execute("UPDATE payments SET status='paid' WHERE uuid=$1", inv["uuid"])
+            except Exception:
+                pass
+
+    if settings.TEST_MODE:
+        ok = True
+
+    if ok:
+        await execute("UPDATE users SET status='active' WHERE id=$1", user["id"])
+        await cb.answer("Готово ✅", show_alert=True)
+        texts = i18n._texts[user["language"]]
+        await replace_message(cb.message, texts["activated"])
+        await cb.message.answer(texts["main_menu"], reply_markup=main_menu_kb(texts))
+    else:
+        await cb.answer("Платіж ще не підтверджено, спробуйте пізніше 🙏", show_alert=True)
 
 
 @router.callback_query(F.data=='paid_check')
