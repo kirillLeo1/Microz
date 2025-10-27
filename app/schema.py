@@ -87,41 +87,44 @@ CREATE TABLE IF NOT EXISTS referral_rewards (
 );
 '''
 async def run_stars_migration():
-    # 1) provider
-    await execute("""
-        ALTER TABLE payments
-        ADD COLUMN IF NOT EXISTS provider TEXT
-    """)
-    # Якщо колонка з’явилась порожня – проставимо значення для старих рядків
+    # 1) колонки
+    await execute("ALTER TABLE payments ADD COLUMN IF NOT EXISTS provider TEXT")
     await execute("UPDATE payments SET provider='cryptocloud' WHERE provider IS NULL")
-    await execute("""
-        ALTER TABLE payments
-        ALTER COLUMN provider SET DEFAULT 'cryptocloud'
-    """)
+    await execute("ALTER TABLE payments ALTER COLUMN provider SET DEFAULT 'cryptocloud'")
     await execute("""
         DO $$
         BEGIN
             IF NOT EXISTS (
                 SELECT 1
-                FROM information_schema.columns
-                WHERE table_name='payments' AND column_name='provider'
-                  AND is_nullable='NO'
+                  FROM information_schema.columns
+                 WHERE table_name='payments' AND column_name='provider'
+                   AND is_nullable='NO'
             ) THEN
                 ALTER TABLE payments ALTER COLUMN provider SET NOT NULL;
             END IF;
         END$$;
     """)
 
-    # 2) order_id / currency / amount_stars
     await execute("ALTER TABLE payments ADD COLUMN IF NOT EXISTS order_id TEXT")
     await execute("ALTER TABLE payments ADD COLUMN IF NOT EXISTS currency TEXT")
     await execute("ALTER TABLE payments ADD COLUMN IF NOT EXISTS amount_stars INTEGER")
 
-    # 3) індекси
+    -- створюємо саме CONSTRAINT (не індекс), щоб ON CONFLICT гарантовано спрацював
     await execute("""
-        CREATE UNIQUE INDEX IF NOT EXISTS payments_provider_order_uniq
-        ON payments(provider, order_id) WHERE order_id IS NOT NULL
+        DO $$
+        BEGIN
+            IF NOT EXISTS (
+                SELECT 1 FROM pg_constraint
+                WHERE conname = 'payments_provider_order_uniq'
+            ) THEN
+                ALTER TABLE payments
+                ADD CONSTRAINT payments_provider_order_uniq
+                UNIQUE (provider, order_id);
+            END IF;
+        END$$;
     """)
+
+    -- (не обовʼязково) допоміжний індекс по provider
     await execute("""
         CREATE INDEX IF NOT EXISTS payments_provider_idx
         ON payments(provider)
