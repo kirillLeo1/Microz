@@ -70,5 +70,9 @@
   "open_chat": "Message user",
   "paid_ok": "Marked as paid and QC deducted.",
   "processed_ok": "Marked as processed.",
-  "help": "This is a micro-task bot. Activate access for $1, do steps and earn QC."
+  "help": "This is a micro-task bot. Activate access for $1, do steps and earn QC.",
+  "pay_stars": "Pay ⭐️ Stars",
+  "pay_crypto": "Pay crypto (CryptoCloud)",
+  "i_paid": "I paid",
+  "activated": "✅ Access activated!"
 }
