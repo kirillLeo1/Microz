@@ -95,22 +95,23 @@ async def run_stars_migration():
     await execute("UPDATE payments SET provider='cryptocloud' WHERE provider IS NULL")
     await execute("ALTER TABLE payments ALTER COLUMN provider SET DEFAULT 'cryptocloud'")
 
-    # <-- критично для Stars
+    # ⬇️ КРИТИЧНО для Stars:
     await execute("ALTER TABLE payments ALTER COLUMN uuid DROP NOT NULL")
+    await execute("ALTER TABLE payments ALTER COLUMN amount_usd DROP NOT NULL")
 
+    # унікальність для upsert по (provider, order_id)
     await execute("""
         DO $$
         BEGIN
             IF NOT EXISTS (
-                SELECT 1 FROM pg_constraint WHERE conname = 'payments_provider_order_uniq'
+                SELECT 1 FROM pg_constraint WHERE conname='payments_provider_order_uniq'
             ) AND NOT EXISTS (
                 SELECT 1
-                FROM pg_class c
-                JOIN pg_namespace n ON n.oid = c.relnamespace
-                WHERE c.relkind = 'i' AND c.relname = 'payments_provider_order_uidx'
+                FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace
+                WHERE c.relkind='i' AND c.relname='payments_provider_order_uidx'
             ) THEN
                 CREATE UNIQUE INDEX payments_provider_order_uidx
-                ON payments (provider, order_id);
+                ON payments(provider, order_id);
             END IF;
         END$$;
     """)
