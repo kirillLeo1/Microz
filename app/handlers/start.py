@@ -5,7 +5,7 @@ from ..utils.i18n import i18n
 from ..utils.keyboards import lang_kb, activation_kb, main_menu_kb
 from ..services.tasks_service import ensure_user, set_language, get_user, award_referral_if_needed, activate_user
 from ..config import settings
-from ..utils.payments import create_invoice, get_invoices_info
+from ..utils.payments import create_invoice as cc_create, get_invoices_info
 from ..db import fetchrow
 from ..services.tasks_service import create_invoice as db_create_invoice, set_payment_status
 from ..utils.tg import replace_message
