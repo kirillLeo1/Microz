@@ -65,7 +65,12 @@ async def polling():
         await on_shutdown(bot)
 
     try:
-        await dp.start_polling(bot, on_startup=startup, on_shutdown=shutdown)
+        await dp.start_polling(
+            bot,
+            on_startup=startup,
+            on_shutdown=shutdown,
+            allowed_updates=dp.resolve_used_update_types(),
+        )
     finally:
         await bot.session.close()
 
@@ -97,7 +102,10 @@ async def webhook():
     async def on_app_start(app_):
         await on_startup(bot)
         wh_url = (settings.WEBHOOK_URL or "").rstrip("/") + settings.WEBHOOK_PATH
-        await bot.set_webhook(wh_url, drop_pending_updates=True)
+        await bot.delete_webhook(drop_pending_updates=True)
+        updates = dp.resolve_used_update_types()
+        await bot.set_webhook(wh_url, drop_pending_updates=True, allowed_updates=updates)
+
 
     async def on_app_stop(app_):
         await on_shutdown(bot)
