@@ -87,32 +87,27 @@ CREATE TABLE IF NOT EXISTS referral_rewards (
 );
 '''
 async def run_stars_migration():
-    # 1) Колонки
     await execute("ALTER TABLE payments ADD COLUMN IF NOT EXISTS provider TEXT")
     await execute("ALTER TABLE payments ADD COLUMN IF NOT EXISTS order_id TEXT")
     await execute("ALTER TABLE payments ADD COLUMN IF NOT EXISTS currency TEXT")
     await execute("ALTER TABLE payments ADD COLUMN IF NOT EXISTS amount_stars INTEGER")
 
-    # 2) Дефолт + підчистити NULL'и
     await execute("UPDATE payments SET provider='cryptocloud' WHERE provider IS NULL")
     await execute("ALTER TABLE payments ALTER COLUMN provider SET DEFAULT 'cryptocloud'")
 
-    # 3) Якщо вже є УНІКАЛЬНИЙ КОНСТРЕЙНТ (старий підхід) — нічого не створюємо
-    #    Якщо його немає, але є УНІКАЛЬНИЙ ІНДЕКС — теж ок, нічого не створюємо
-    #    Якщо немає нічого — створюємо унікальний індекс з іншим ім’ям
+    # <-- критично для Stars
+    await execute("ALTER TABLE payments ALTER COLUMN uuid DROP NOT NULL")
+
     await execute("""
         DO $$
         BEGIN
             IF NOT EXISTS (
-                SELECT 1
-                FROM pg_constraint
-                WHERE conname = 'payments_provider_order_uniq'
+                SELECT 1 FROM pg_constraint WHERE conname = 'payments_provider_order_uniq'
             ) AND NOT EXISTS (
                 SELECT 1
                 FROM pg_class c
                 JOIN pg_namespace n ON n.oid = c.relnamespace
-                WHERE c.relkind = 'i'
-                  AND c.relname = 'payments_provider_order_uidx'
+                WHERE c.relkind = 'i' AND c.relname = 'payments_provider_order_uidx'
             ) THEN
                 CREATE UNIQUE INDEX payments_provider_order_uidx
                 ON payments (provider, order_id);
