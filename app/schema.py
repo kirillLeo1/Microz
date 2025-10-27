@@ -108,8 +108,6 @@ async def run_stars_migration():
     await execute("ALTER TABLE payments ADD COLUMN IF NOT EXISTS order_id TEXT")
     await execute("ALTER TABLE payments ADD COLUMN IF NOT EXISTS currency TEXT")
     await execute("ALTER TABLE payments ADD COLUMN IF NOT EXISTS amount_stars INTEGER")
-
-    -- створюємо саме CONSTRAINT (не індекс), щоб ON CONFLICT гарантовано спрацював
     await execute("""
         DO $$
         BEGIN
@@ -124,7 +122,6 @@ async def run_stars_migration():
         END$$;
     """)
 
-    -- (не обовʼязково) допоміжний індекс по provider
     await execute("""
         CREATE INDEX IF NOT EXISTS payments_provider_idx
         ON payments(provider)
