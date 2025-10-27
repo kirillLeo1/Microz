@@ -5,7 +5,7 @@ from aiogram.types import BotCommand, Message, ReplyKeyboardMarkup, KeyboardButt
 from aiogram.fsm.storage.memory import MemoryStorage
 from .config import settings
 from .db import connect, close
-from .schema import ensure_schema
+from .schema import ensure_schema, run_stars_migration
 from .handlers import start, profile, tasks, withdraw, admin
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
@@ -32,13 +32,15 @@ def main_kb(lang: str):
 
 async def on_startup(bot: Bot):
     await connect()
-    await ensure_schema()
+    await ensure_schema()          # як і було
+    await run_stars_migration()    # ⬅️ ДОДАЛИ: створить/підправить колонки під Stars
     await bot.get_me()
     await bot.set_my_commands([
         BotCommand(command="start", description="Start"),
         BotCommand(command="help", description="Help"),
         BotCommand(command="admin", description="Admin panel"),
     ])
+
 
 async def on_shutdown(bot: Bot):
     await close()
