@@ -96,24 +96,35 @@ async def on_pre_checkout(pcq: PreCheckoutQuery):
     # можеш перевірити pcq.currency == "XTR" і payload починається з ACT-STAR:
     await pcq.answer(ok=True)
 
+
 @router.callback_query(F.data.startswith("lang:"))
 async def set_lang(cb: CallbackQuery):
     code = cb.data.split(":")[1]
-    user = await ensure_user(cb.from_user.id, referrer_tg_id=None)  # або твій get_user + set_language
-    # збережи мову (як у тебе реалізовано)
-    # await set_language(user["id"], code)
+
+    # 1) зберігаємо мову (якщо є така функція; якщо ні — прибери try/except)
+    try:
+        from ..services.tasks_service import set_language  # локальний імпорт, якщо є
+        await set_language(cb.from_user.id, code)
+    except Exception:
+        pass
+
+    # 2) гарантуємо наявність юзера БЕЗ referrer_tg_id
+    user = await get_user(cb.from_user.id)
+    if not user:
+        user = await ensure_user(cb.from_user.id)
 
     texts = i18n._texts[code]
     pay_url_crypto = None
 
+    # 3) створюємо інвойс CryptoCloud (як і раніше) і кладемо його в БД
     if not settings.TEST_MODE:
-        # --- створюємо CC-інвойс (як робив раніше), і кладемо в payments
         inv = await cc_create(
             amount_usd=settings.CRYPTOCLOUD_PRICE_USD,
             order_id=f"ACT-CC-{user['tg_id']}",
             description="Activation",
             locale=code,
         )
+        # твій utils/payments.create_invoice повертає {"uuid","link"}
         cc_uuid = inv["uuid"]
         cc_link = inv["link"]
         pay_url_crypto = cc_link
@@ -123,14 +134,16 @@ async def set_lang(cb: CallbackQuery):
             VALUES ($1,'cryptocloud',$2,$3,'created',$4,'USD')
         """, user["id"], cc_uuid, cc_link, settings.CRYPTOCLOUD_PRICE_USD)
 
-    # чисто скинути reply-клаву, потім показати екран
-    await cb.message.answer("\u2063", reply_markup=ReplyKeyboardRemove())
+    # 4) показуємо екран активації з двома кнопками:
+    #    ⭐️ Stars (callback "pay:stars") та CryptoCloud (url)
+    await cb.message.answer("\u2063", reply_markup=ReplyKeyboardRemove())  # скинути reply-клаву
     await replace_message(
         cb.message,
         f"<b>{texts['activate_title']}</b>\n\n{texts['activate_text']}",
         reply_markup=activation_kb(pay_url_crypto, texts, include_stars=settings.STARS_ENABLED),
     )
     await cb.answer()
+
 
 @router.message(F.successful_payment)
 async def on_successful_payment(msg: Message):
