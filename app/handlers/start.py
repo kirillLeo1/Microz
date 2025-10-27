@@ -93,8 +93,12 @@ async def pay_stars(cb: CallbackQuery):
 
 @router.pre_checkout_query()
 async def on_pre_checkout(pcq: PreCheckoutQuery):
-    # можеш перевірити pcq.currency == "XTR" і payload починається з ACT-STAR:
+    payload = pcq.invoice_payload or ""
+    if pcq.currency != "XTR" or not payload.startswith("ACT-STAR:"):
+        await pcq.answer(ok=False, error_message="Invalid payment payload")
+        return
     await pcq.answer(ok=True)
+
 
 
 @router.callback_query(F.data.startswith("lang:"))
@@ -149,36 +153,37 @@ async def set_lang(cb: CallbackQuery):
 async def on_successful_payment(msg: Message):
     sp = msg.successful_payment
 
-    # Працюємо тільки з оплатами в зірках
+    # Працюємо тільки з Telegram Stars
     if (sp.currency or "").upper() != "XTR":
         return
 
-    # Наш order_id — це payload, який ми підставляли у send_invoice (типу "ACT-STAR:<tg_id>:<ts>")
+    # order_id беремо з payload (який ти подавав у send_invoice), резерв — charge_id
     order_id = sp.invoice_payload or sp.provider_payment_charge_id or sp.telegram_payment_charge_id
     if not order_id or not str(order_id).startswith("ACT-STAR:"):
-        return  # це не наша активація
+        return  # не наша активація
 
-    # Юзера дістаємо/гарантуємо
-    user = await get_user(msg.from_user.id)
-    if not user:
-        user = await ensure_user(msg.from_user.id)
+    # гарантуємо юзера
+    user = await get_user(msg.from_user.id) or await ensure_user(msg.from_user.id)
+
+    # Записуємо платіж (idempotent через ON CONFLICT)
+    # amount_usd ставимо NULL (бо це "зірковий" платіж), а uuid кладемо = order_id для сумісності
     await execute("""
-        INSERT INTO payments (user_id, provider, order_id, uuid, status, currency, amount_stars)
-        VALUES ($1, 'stars', $2, $2, 'paid', 'XTR', $3)
+        INSERT INTO payments (user_id, provider, order_id, uuid, status, currency, amount_stars, amount_usd)
+        VALUES ($1, 'stars', $2, $2, 'paid', 'XTR', $3, NULL)
         ON CONFLICT (provider, order_id)
         DO UPDATE SET status='paid',
                       amount_stars=EXCLUDED.amount_stars,
                       updated_at=NOW()
     """, user["id"], order_id, sp.total_amount)
 
-    # Активуємо доступ і видаємо одноразовий реферал-бонус (твоя існуюча логіка)
+    # Активуємо доступ + реферал-бонус (твоя існуюча логіка)
     await activate_user(msg.from_user.id)
     await award_referral_if_needed(msg.from_user.id)
 
-    # Повідомлення + меню
+    # Відповідь і меню
     lang = (user.get("language") or "en")
     texts = i18n._texts[lang]
-    await msg.answer(texts["activated"])
+    await msg.answer(texts.get("activated", "✅ Доступ активовано."))
     await msg.answer(texts["main_menu"], reply_markup=main_menu_kb(texts))
 
 @router.callback_query(F.data == "activation:check")
