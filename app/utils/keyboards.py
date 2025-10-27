@@ -68,3 +68,12 @@ def step_check_kb(check_text: str, step_id: int, chain_id: int):
         )
     )
     return kb.as_markup()
+
+def activation_kb(pay_url_crypto: str | None, texts: dict, include_stars: bool = True):
+    rows = []
+    if include_stars:
+        rows.append([InlineKeyboardButton(text=texts["pay_stars"], callback_data="pay:stars")])
+    if pay_url_crypto:
+        rows.append([InlineKeyboardButton(text=texts["pay_crypto"], url=pay_url_crypto)])
+    rows.append([InlineKeyboardButton(text=texts["i_paid"], callback_data="activation:check")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
