@@ -148,33 +148,36 @@ async def set_lang(cb: CallbackQuery):
 @router.message(F.successful_payment)
 async def on_successful_payment(msg: Message):
     sp = msg.successful_payment
-    if sp.currency != "XTR":
-        return
-    payload = sp.invoice_payload or ""
-    if not payload.startswith("ACT-STAR:"):
+
+    # Працюємо тільки з оплатами в зірках
+    if (sp.currency or "").upper() != "XTR":
         return
 
+    # Наш order_id — це payload, який ми підставляли у send_invoice (типу "ACT-STAR:<tg_id>:<ts>")
+    order_id = sp.invoice_payload or sp.provider_payment_charge_id or sp.telegram_payment_charge_id
+    if not order_id or not str(order_id).startswith("ACT-STAR:"):
+        return  # це не наша активація
+
+    # Юзера дістаємо/гарантуємо
     user = await get_user(msg.from_user.id)
-
-    # зафіксувати платіж Stars (ідемпотентно)
+    if not user:
+        user = await ensure_user(msg.from_user.id)
     await execute("""
-        INSERT INTO payments (user_id, provider, order_id, status, currency, amount_stars)
-        VALUES ($1,'stars',$2,'paid','XTR',$3)
+        INSERT INTO payments (user_id, provider, order_id, uuid, status, currency, amount_stars)
+        VALUES ($1, 'stars', $2, $2, 'paid', 'XTR', $3)
         ON CONFLICT (provider, order_id)
-        DO UPDATE SET status='paid', amount_stars=EXCLUDED.amount_stars
-    """, user["id"], payload, sp.total_amount)
+        DO UPDATE SET status='paid',
+                      amount_stars=EXCLUDED.amount_stars,
+                      updated_at=NOW()
+    """, user["id"], order_id, sp.total_amount)
 
-    # активуємо акаунт + одноразовий реф-бонус
-    await execute("UPDATE users SET status='active' WHERE id=$1", user["id"])
-    await execute("""
-        UPDATE users u SET earned_total_qc = earned_total_qc + 60
-        FROM users r
-        WHERE r.id = $1 AND r.referrer_id = u.id
-          AND r.referral_bonus_given IS DISTINCT FROM TRUE
-    """, user["id"])
-    await execute("UPDATE users SET referral_bonus_given=TRUE WHERE id=$1", user["id"])
+    # Активуємо доступ і видаємо одноразовий реферал-бонус (твоя існуюча логіка)
+    await activate_user(msg.from_user.id)
+    await award_referral_if_needed(msg.from_user.id)
 
-    texts = i18n._texts[user["language"]]
+    # Повідомлення + меню
+    lang = (user.get("language") or "en")
+    texts = i18n._texts[lang]
     await msg.answer(texts["activated"])
     await msg.answer(texts["main_menu"], reply_markup=main_menu_kb(texts))
 
