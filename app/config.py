@@ -10,6 +10,10 @@ class Settings(BaseSettings):
     CRYPTOCLOUD_SHOP_ID: str = ""
     CRYPTOCLOUD_CURRENCY: str = "USD"
     CRYPTOCLOUD_PRICE_USD: float = 1.00
+    STARS_ENABLED: bool = True
+    STARS_PRICE_XTR: int = 100
+    STARS_TITLE: str = "Activation"
+    STARS_DESCRIPTION: str = "One-time activation"
     TEST_MODE: bool = False
     WEBHOOK_URL: str | None = None
     WEBHOOK_PATH: str = "/webhook"
