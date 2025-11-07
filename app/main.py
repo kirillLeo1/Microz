@@ -10,6 +10,7 @@ from .config import settings
 from .db import connect, close, execute, fetchrow
 from .schema import ensure_schema, run_stars_migration
 from .handlers import start, profile, tasks, withdraw, admin
+from aiocryptopay import AioCryptoPay, Networks
 
 # === NEW: для верификации подписи MonoPay
 import ecdsa  # pip install ecdsa
@@ -56,9 +57,24 @@ def _verify_mono_xsign(pubkey_pem: bytes, body: bytes, x_sign_b64: str) -> bool:
     except Exception:
         return False
 
+async def _ensure_crypto_webhook():
+    if not settings.CRYPTO_PAY_TOKEN or not settings.WEBHOOK_URL:
+        return
+    url = (settings.WEBHOOK_URL or "").rstrip("/") + settings.CRYPTO_WEBHOOK_PATH
+    crypto = AioCryptoPay(
+        token=settings.CRYPTO_PAY_TOKEN,
+        network=Networks.TEST_NET if settings.TEST_MODE else Networks.MAIN_NET
+    )
+    try:
+        await crypto.set_webhook(url)   # регистрируем /cryptobot
+    finally:
+        await crypto.close()
+
+
 async def on_startup(bot: Bot):
     await connect()
     await ensure_schema()
+    await _ensure_crypto_webhook()
     try:
         await run_stars_migration()
     except Exception:
