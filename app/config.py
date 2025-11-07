@@ -6,14 +6,19 @@ class Settings(BaseSettings):
     BOT_TOKEN: str
     ADMIN_IDS: List[int] = Field(default_factory=list)
     DATABASE_URL: str
-    CRYPTOCLOUD_API_KEY: str = ""
-    CRYPTOCLOUD_SHOP_ID: str = ""
-    CRYPTOCLOUD_CURRENCY: str = "USD"
-    CRYPTOCLOUD_PRICE_USD: float = 1.00
-    STARS_ENABLED: bool = True
-    STARS_PRICE_XTR: int = 100
-    STARS_TITLE: str = "Activation"
-    STARS_DESCRIPTION: str = "One-time activation"
+
+    # === Глобальная цена
+    PRICE_USD: float = 2.0
+    USD_TO_UAH: float = 40.0  # курс для конвертации в UAH (можно переопределить в .env)
+
+    # === MonoPay
+    MONOPAY_TOKEN: str = ""                 # X-Token мерчанта
+    MONOPAY_WEBHOOK_PATH: str = "/monopay"  # путь вебхука
+
+    # === CryptoBot
+    CRYPTO_PAY_TOKEN: str = ""                 # токен из @CryptoBot
+    CRYPTO_WEBHOOK_PATH: str = "/cryptobot"    # путь вебхука
+
     TEST_MODE: bool = False
     WEBHOOK_URL: str | None = None
     WEBHOOK_PATH: str = "/webhook"
