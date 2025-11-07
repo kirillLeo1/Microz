@@ -10,21 +10,21 @@ def lang_kb():
     )
     return kb.as_markup()
 
-def activation_kb(pay_url: str | None, texts):
-    kb = InlineKeyboardBuilder()
-    if pay_url:
-        kb.row(InlineKeyboardButton(text=texts["pay_btn"], url=pay_url))
-    kb.row(InlineKeyboardButton(text=texts["i_paid_btn"], callback_data="paid_check"))
-    return kb.as_markup()
+def activation_kb(pay_url_mono: str | None, pay_url_crypto: str | None, texts: dict):
+    rows = []
+    if pay_url_mono:
+        rows.append([InlineKeyboardButton(text=texts.get("pay_mono", "💳 Оплатить картой (MonoPay)"), url=pay_url_mono)])
+    if pay_url_crypto:
+        rows.append([InlineKeyboardButton(text=texts.get("pay_crypto", "🪙 Оплатить криптой (CryptoBot)"), url=pay_url_crypto)])
+    rows.append([InlineKeyboardButton(text=texts.get("i_paid", "✅ Я оплатил"), callback_data="activation:check")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
 
 def tasks_chain_kb(items):
-    # items: list of tuples (text, cbdata or None, disabled)
     kb = InlineKeyboardBuilder()
     for text, cb, disabled in items:
         if cb:
             kb.row(InlineKeyboardButton(text=text, callback_data=cb))
         else:
-            # disabled line as label
             kb.row(InlineKeyboardButton(text=text, callback_data="noop"))
     return kb.as_markup()
 
@@ -33,11 +33,8 @@ def step_kb(open_url: str, check_text: str, open_text: str, step_id: int, chain_
     kb.row(InlineKeyboardButton(text=open_text, url=open_url))
     kb.row(InlineKeyboardButton(text=check_text, callback_data=f"step_check:{step_id}:{chain_id}"))
     return kb.as_markup()
-    
+
 def main_menu_kb(texts: dict) -> ReplyKeyboardMarkup:
-    """
-    Reply-клава головного меню. texts — це i18n._texts[lang].
-    """
     return ReplyKeyboardMarkup(
         keyboard=[
             [KeyboardButton(text=texts["tasks_btn"])],
@@ -68,12 +65,4 @@ def step_check_kb(check_text: str, step_id: int, chain_id: int):
         )
     )
     return kb.as_markup()
-
-def activation_kb(pay_url_crypto: str | None, texts: dict, include_stars: bool = True):
-    rows = []
-    if include_stars:
-        rows.append([InlineKeyboardButton(text=texts["pay_stars"], callback_data="pay:stars")])
-    if pay_url_crypto:
-        rows.append([InlineKeyboardButton(text=texts["pay_crypto"], url=pay_url_crypto)])
-    rows.append([InlineKeyboardButton(text=texts["i_paid"], callback_data="activation:check")])
-    return InlineKeyboardMarkup(inline_keyboard=rows)
+м
