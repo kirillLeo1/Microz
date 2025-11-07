@@ -1,12 +1,10 @@
 import os
 import json
-import time
 import aiohttp
 import logging
 from dataclasses import dataclass
 
 from aiocryptopay import AioCryptoPay, Networks
-
 from ..config import settings
 
 log = logging.getLogger("payments")
@@ -22,7 +20,7 @@ def usd_to_uah_cop(usd: float) -> int:
     PRICE_USD * USD_TO_UAH * 100  -> int
     """
     rate = float(os.getenv("USD_TO_UAH", settings.USD_TO_UAH))
-    return int(round(usd * rate * 100))
+    return int(round(float(usd) * rate * 100))
 
 
 @dataclass
@@ -39,23 +37,31 @@ async def create_monopay_invoice(order_id: str, description: str = "Activation")
     """
     Создаёт счёт в MonoPay и отдаёт ссылку для оплаты.
     Сумма считается из PRICE_USD -> копейки UAH.
+    ВАЖНО: webHookUrl должен быть на верхнем уровне payload (НЕ внутри merchantPaymInfo).
     """
     amount_cop = usd_to_uah_cop(settings.PRICE_USD)
 
     headers = {"X-Token": settings.MONOPAY_TOKEN}
+    webhook_url = (settings.WEBHOOK_URL or "").rstrip("/") + settings.MONOPAY_WEBHOOK_PATH
+
     payload = {
-        "amount": amount_cop,     # копейки
-        "ccy": 980,
+        "amount": amount_cop,            # копейки
+        "ccy": 980,                      # UAH
         "merchantPaymInfo": {
             "reference": order_id,
             "basketOrder": [{"name": description, "qty": 1, "sum": amount_cop}],
-            "webHookUrl": (settings.WEBHOOK_URL or "").rstrip("/") + settings.MONOPAY_WEBHOOK_PATH,
         },
+        # ВОТ ТУТ ГЛАВНОЕ: webHookUrl ДОЛЖЕН БЫТЬ В КОРНЕ
+        "webHookUrl": webhook_url,
+        # редирект — опционально (можно на твою страницу «спасибо»)
+        # "redirectUrl": (settings.WEBHOOK_URL or "").rstrip("/") + "/paid",
         "paymentType": "debit",
-        "validityDuration": 86400,  # 24h
+        "validityDuration": 86400,       # 24h, опционально
     }
+
     async with aiohttp.ClientSession() as s:
-        async with s.post(f"{MONO_BASE}/api/merchant/invoice/create", json=payload, headers=headers, timeout=30) as r:
+        async with s.post(f"{MONO_BASE}/api/merchant/invoice/create",
+                          json=payload, headers=headers, timeout=30) as r:
             data = await r.json()
     log.info("Mono create_invoice resp: %s", data)
 
@@ -96,4 +102,5 @@ async def get_cryptobot_invoice(invoice_id: str):
     items = await crypto.get_invoices(invoice_ids=[int(invoice_id)])
     await crypto.close()
     return items[0] if items else None
+
 
