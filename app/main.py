@@ -71,14 +71,40 @@ async def _fetch_mono_pubkey_pem() -> bytes:
 
 def _verify_mono_xsign(pubkey_pem: bytes, body: bytes, x_sign_b64: str) -> bool:
     """
-    Верификация X-Sign (DER) по ECDSA SHA-256.
+    Monobank может прислать X-Sign как DER ИЛИ как "raw" 64 байта (r||s).
+    Проверяем оба варианта.
     """
     try:
-        signature = base64.b64decode(x_sign_b64)
-        vk = ecdsa.VerifyingKey.from_pem(pubkey_pem.decode())
-        return vk.verify(signature, body, sigdecode=ecdsa.util.sigdecode_der, hashfunc=hashlib.sha256)
+        # base64 с возможным отсутствующим паддингом
+        s = x_sign_b64.strip()
+        pad = (-len(s)) % 4
+        if pad:
+            s += "=" * pad
+        sig = base64.b64decode(s)
     except Exception:
         return False
+
+    try:
+        vk = ecdsa.VerifyingKey.from_pem(pubkey_pem.decode())
+    except Exception:
+        return False
+
+    # 1) Пытаемся как DER
+    try:
+        if vk.verify(sig, body, sigdecode=ecdsa.util.sigdecode_der, hashfunc=hashlib.sha256):
+            return True
+    except Exception:
+        pass
+
+    # 2) Пытаемся как "raw" r||s (64 байта)
+    try:
+        if len(sig) == 64 and vk.verify(sig, body, sigdecode=ecdsa.util.sigdecode_string, hashfunc=hashlib.sha256):
+            return True
+    except Exception:
+        pass
+
+    return False
+
 
 
 # --- CryptoPay: «секретный» путь вебхука (по рекомендации доков, и без setWebhook через API)
