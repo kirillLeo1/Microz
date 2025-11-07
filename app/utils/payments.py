@@ -1,91 +1,99 @@
+import os
+import json
+import time
 import aiohttp
 import logging
+from dataclasses import dataclass
+
+from aiocryptopay import AioCryptoPay, Networks
+
 from ..config import settings
 
-BASE_URL = "https://api.cryptocloud.plus"
 log = logging.getLogger("payments")
 
-class CryptoCloudError(Exception):
-    pass
+MONO_BASE = "https://api.monobank.ua"
 
 
-async def create_invoice(
-    amount_usd: float,
-    order_id: str,
-    description: str = "Activation",
-    locale: str = "en",
-) -> dict:
+# ===== Helpers
+
+def usd_to_uah_cop(usd: float) -> int:
     """
-    Створює інвойс і ПОВЕРТАЄ УЖЕ нормалізоване:
-    {"uuid": "...", "link": "https://pay.cryptocloud.plus/invoice/..." }
+    Конвертация USD -> UAH (копейки) с настраиваемым курсом.
+    PRICE_USD * USD_TO_UAH * 100  -> int
     """
-    url = f"{BASE_URL}/v2/invoice/create"
-    headers = {
-        "Authorization": f"Token {settings.CRYPTOCLOUD_API_KEY}",
-        "Content-Type": "application/json",
-    }
+    rate = float(os.getenv("USD_TO_UAH", settings.USD_TO_UAH))
+    return int(round(usd * rate * 100))
+
+
+@dataclass
+class Invoice:
+    provider: str
+    invoice_id: str
+    pay_url: str
+    extra: dict | None = None
+
+
+# ===== MonoPay
+
+async def create_monopay_invoice(order_id: str, description: str = "Activation") -> Invoice:
+    """
+    Создаёт счёт в MonoPay и отдаёт ссылку для оплаты.
+    Сумма считается из PRICE_USD -> копейки UAH.
+    """
+    amount_cop = usd_to_uah_cop(settings.PRICE_USD)
+
+    headers = {"X-Token": settings.MONOPAY_TOKEN}
     payload = {
-        "shop_id": settings.CRYPTOCLOUD_SHOP_ID,          # ← обов'язково
-        "amount": f"{amount_usd:.2f}",
-        "currency": getattr(settings, "CRYPTOCLOUD_CURRENCY", "USD"),
-        "order_id": order_id,
-        "description": description,
-        "locale": locale,                                  # ← у JSON, не в query
-        # опціонально:
-        # "success_url": "...",
-        # "fail_url": "...",
+        "amount": amount_cop,     # копейки
+        "ccy": 980,
+        "merchantPaymInfo": {
+            "reference": order_id,
+            "basketOrder": [{"name": description, "qty": 1, "sum": amount_cop}],
+            "webHookUrl": (settings.WEBHOOK_URL or "").rstrip("/") + settings.MONOPAY_WEBHOOK_PATH,
+        },
+        "paymentType": "debit",
+        "validityDuration": 86400,  # 24h
     }
-
     async with aiohttp.ClientSession() as s:
-        async with s.post(url, headers=headers, json=payload, timeout=30) as r:
+        async with s.post(f"{MONO_BASE}/api/merchant/invoice/create", json=payload, headers=headers, timeout=30) as r:
             data = await r.json()
+    log.info("Mono create_invoice resp: %s", data)
 
-    log.info("CC create_invoice resp: %s", data)
+    invoice_id = data.get("invoiceId") or data.get("invoice_id", "")
+    pay_url = data.get("pageUrl") or data.get("invoiceUrl") or data.get("payUrl", "")
+    if not invoice_id or not pay_url:
+        raise RuntimeError(f"Mono create_invoice failed: {data}")
 
-    # у CC зазвичай: {"status": "success", "result": {...}}
-    status = (data.get("status") or "").lower()
-    if status not in ("success", "ok", "created"):
-        raise CryptoCloudError(
-            data.get("message") or data.get("description") or str(data)
-        )
-
-    res = data.get("result") or {}
-    uuid = res.get("uuid") or res.get("invoice") or res.get("id")
-    link = res.get("link") or res.get("pay_url") or res.get("url")
-    if not link and uuid:
-        # запасний варіант, коли API не повернув link
-        link = f"https://pay.cryptocloud.plus/invoice/{uuid}"
-
-    if not uuid or not link:
-        raise CryptoCloudError(f"create_invoice: missing uuid/link. raw={data}")
-
-    return {"uuid": uuid, "link": link}
+    return Invoice("monopay", invoice_id, pay_url, extra=data)
 
 
-async def get_invoices_info(uuids: list[str]) -> list[dict]:
+# ===== CryptoBot (Crypto Pay API)
+
+def _crypto_network():
+    return Networks.MAIN_NET if not settings.TEST_MODE else Networks.TEST_NET
+
+async def create_cryptobot_invoice(order_id: str, description: str = "Activation") -> Invoice:
     """
-    Повертає список інвойсів; елементи мають поле 'status' (paid/overpaid/partial/...).
+    Создаёт инвойс в CryptoBot в фиате USD.
+    Возвращает bot_invoice_url.
     """
-    url = f"{BASE_URL}/v2/invoice/merchant/info"
-    headers = {
-        "Authorization": f"Token {settings.CRYPTOCLOUD_API_KEY}",
-        "Content-Type": "application/json",
-    }
-    payload = {"uuids": uuids}
+    crypto = AioCryptoPay(token=settings.CRYPTO_PAY_TOKEN, network=_crypto_network())
+    inv = await crypto.create_invoice(
+        currency_type="fiat",
+        fiat="USD",
+        amount=float(settings.PRICE_USD),
+        description=description,
+        payload=order_id,
+    )
+    await crypto.close()
+    return Invoice("cryptobot", str(inv.invoice_id), inv.bot_invoice_url, extra={"status": inv.status})
 
-    async with aiohttp.ClientSession() as s:
-        async with s.post(url, headers=headers, json=payload, timeout=30) as r:
-            data = await r.json()
-
-    log.info("CC merchant/info resp: %s", data)
-
-    status = (data.get("status") or "").lower()
-    if status not in ("success", "ok"):
-        raise CryptoCloudError(
-            data.get("message") or data.get("description") or str(data)
-        )
-
-    res = data.get("result") or {}
-    items = res.get("invoices") if isinstance(res, dict) else res
-    return items if isinstance(items, list) else []
+async def get_cryptobot_invoice(invoice_id: str):
+    """
+    Получить инфо по инвойсу CryptoBot (по id).
+    """
+    crypto = AioCryptoPay(token=settings.CRYPTO_PAY_TOKEN, network=_crypto_network())
+    items = await crypto.get_invoices(invoice_ids=[int(invoice_id)])
+    await crypto.close()
+    return items[0] if items else None
 
