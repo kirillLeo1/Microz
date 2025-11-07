@@ -10,7 +10,7 @@ from .config import settings
 from .db import connect, close, execute, fetchrow
 from .schema import ensure_schema, run_stars_migration
 from .handlers import start, profile, tasks, withdraw, admin
-from aiocryptopay import AioCryptoPay, Networks  # остаётся для совместимости, инвойсы и т.п.
+from aiocryptopay import AioCryptoPay, Networks  # оставляю для совместимости с payments.py
 
 # === NEW: для верификации подписи MonoPay
 import ecdsa  # pip install ecdsa
@@ -20,14 +20,15 @@ log = logging.getLogger("main")
 
 MONO_BASE = "https://api.monobank.ua"
 
-# Кэш публичного ключа Mono (в PEM-байтах) — сохраняем как bytes
+# Кэш публичного ключа Mono (в PEM-байтах)
 _MONO_PUBKEY_PEM: bytes | None = None
+
 
 async def _fetch_mono_pubkey_pem() -> bytes:
     """
     Тянем ключ из /api/merchant/pubkey c X-Token и приводим к PEM bytes.
     Поддерживаем: чистый PEM; JSON с полями key/pubkey/data; base64 (с любым паддингом);
-    DER → конвертим в PEM.
+    DER → оборачиваем в PEM.
     """
     global _MONO_PUBKEY_PEM
     if _MONO_PUBKEY_PEM:
@@ -42,7 +43,7 @@ async def _fetch_mono_pubkey_pem() -> bytes:
 
     s_txt = txt.strip().strip('"')
 
-    # Попытка распарсить как JSON и вытащить поле
+    # Попытка распарсить как JSON
     try:
         j = json.loads(s_txt)
         s_txt = str(j.get("key") or j.get("pubkey") or j.get("data") or s_txt).strip()
@@ -54,11 +55,11 @@ async def _fetch_mono_pubkey_pem() -> bytes:
         _MONO_PUBKEY_PEM = s_txt.encode()
         return _MONO_PUBKEY_PEM
 
-    # Иначе считаем это base64 (иногда без паддинга). Декодим в DER и оборачиваем в PEM.
+    # Иначе считаем это base64 (в т.ч. без паддинга). Декодим в DER и оборачиваем в PEM.
+    pad = (-len(s_txt)) % 4
+    if pad:
+        s_txt += "=" * pad
     try:
-        pad = (-len(s_txt)) % 4
-        if pad:
-            s_txt += "=" * pad
         der = base64.b64decode(s_txt)
         b64 = base64.encodebytes(der).replace(b"\n\n", b"\n")
         pem = b"-----BEGIN PUBLIC KEY-----\n" + b64 + b"-----END PUBLIC KEY-----\n"
@@ -66,6 +67,7 @@ async def _fetch_mono_pubkey_pem() -> bytes:
         return _MONO_PUBKEY_PEM
     except Exception as e:
         raise RuntimeError(f"bad pubkey format: {e}")
+
 
 def _verify_mono_xsign(pubkey_pem: bytes, body: bytes, x_sign_b64: str) -> bool:
     """
@@ -78,36 +80,18 @@ def _verify_mono_xsign(pubkey_pem: bytes, body: bytes, x_sign_b64: str) -> bool:
     except Exception:
         return False
 
-# --- CryptoBot webhook через HTTP (без падений)
-CRYPTO_BASE = "https://pay.crypt.bot/api"
 
-async def _ensure_crypto_webhook():
+# --- CryptoPay: «секретный» путь вебхука (по рекомендации доков, и без setWebhook через API)
+def _crypto_secret_path() -> str:
     """
-    Ставит вебхук для CryptoBot через HTTP API.
-    Никогда не валит процесс — только логирует результат.
+    Формирует секретный путь для вебхука Crypto Pay.
+    Если в .env задан CRYPTO_WEBHOOK_PATH и он не '/cryptobot' — используем его как есть.
+    Иначе строим '/cryptobot/<sha256(token)[:24]>'.
     """
-    if not settings.CRYPTO_PAY_TOKEN or not settings.WEBHOOK_URL:
-        logging.info("Crypto webhook: пропускаю (нет CRYPTO_PAY_TOKEN или WEBHOOK_URL)")
-        return
-
-    url = (settings.WEBHOOK_URL or "").rstrip("/") + settings.CRYPTO_WEBHOOK_PATH
-    headers = {
-        "Crypto-Pay-API-Token": settings.CRYPTO_PAY_TOKEN,
-        "Content-Type": "application/json",
-    }
-    payload = {"url": url}
-
-    try:
-        async with aiohttp.ClientSession() as s:
-            async with s.post(f"{CRYPTO_BASE}/setWebhook", headers=headers, json=payload, timeout=15) as r:
-                text = await r.text()
-                if r.status == 200:
-                    logging.info("Crypto webhook: установлен %s (%s)", url, text)
-                else:
-                    logging.error("Crypto webhook: статус %s, ответ: %s", r.status, text)
-                    # Например 405 METHOD_NOT_FOUND — у токена нет метода setWebhook. Не критично.
-    except Exception as e:
-        logging.error("Crypto webhook: не удалось установить (%s). Продолжаю без автонстройки.", e)
+    if settings.CRYPTO_WEBHOOK_PATH and settings.CRYPTO_WEBHOOK_PATH != "/cryptobot":
+        return settings.CRYPTO_WEBHOOK_PATH
+    slug = hashlib.sha256((settings.CRYPTO_PAY_TOKEN or "no-token").encode()).hexdigest()[:24]
+    return f"/cryptobot/{slug}"
 
 
 async def on_startup(bot: Bot):
@@ -131,8 +115,10 @@ async def on_startup(bot: Bot):
         except Exception as e:
             log.warning("Mono pubkey preload failed: %s", e)
 
+
 async def on_shutdown(bot: Bot):
     await close()
+
 
 async def polling():
     dp = Dispatcher(storage=MemoryStorage())
@@ -157,16 +143,22 @@ async def polling():
     finally:
         await bot.session.close()
 
+
 # ====== Webhook app ======
 
 async def _verify_crypto_signature(req: web.Request, body: bytes) -> bool:
+    """
+    Crypto Pay: подпись — HMAC_SHA256(body, key=SHA256(token)), заголовок: crypto-pay-api-signature
+    """
     sig = req.headers.get("crypto-pay-api-signature", "")
-    secret = hashlib.sha256(settings.CRYPTO_PAY_TOKEN.encode()).digest()
+    secret = hashlib.sha256((settings.CRYPTO_PAY_TOKEN or "").encode()).digest()
     calc = hmac.new(secret, body, hashlib.sha256).hexdigest()
     return hmac.compare_digest(sig, calc)
 
+
 async def _handle_cryptobot_webhook(request: web.Request):
     body = await request.read()
+    # Если есть токен — валидируем подпись (как в доках)
     if settings.CRYPTO_PAY_TOKEN:
         if not await _verify_crypto_signature(request, body):
             return web.Response(status=403, text="bad signature")
@@ -185,10 +177,11 @@ async def _handle_cryptobot_webhook(request: web.Request):
 
     return web.json_response({"ok": True})
 
+
 async def _handle_monopay_webhook(request: web.Request):
     """
     Жёсткая проверка подписи X-Sign по ECDSA SHA-256.
-    Если не ОК — 403 (monobank попробует повторить до 3 раз). 
+    Если не ОК — 403 (monobank ретраит несколько раз).
     После валидации меняем статус платежа и активируем юзера.
     """
     raw = await request.read()
@@ -201,7 +194,6 @@ async def _handle_monopay_webhook(request: web.Request):
         pubkey_pem = await _fetch_mono_pubkey_pem()
         ok = _verify_mono_xsign(pubkey_pem, raw, x_sign)
         if not ok:
-            # возможна ротация ключа — пробуем рефреш
             global _MONO_PUBKEY_PEM
             _MONO_PUBKEY_PEM = None
             pubkey_pem = await _fetch_mono_pubkey_pem()
@@ -239,8 +231,8 @@ async def _handle_monopay_webhook(request: web.Request):
 
         log.info("Mono success: invoice=%s ref=%s", invoice_id, reference)
 
-    # всегда отвечаем 200, чтобы банк не ретраил, если всё прошло
     return web.Response(text="ok")
+
 
 async def webhook():
     dp = Dispatcher(storage=MemoryStorage())
@@ -264,20 +256,16 @@ async def webhook():
     # Telegram webhook
     app.router.add_post(settings.WEBHOOK_PATH, handle_tg)
 
-    # CryptoBot webhook
-    app.router.add_post(settings.CRYPTO_WEBHOOK_PATH, _handle_cryptobot_webhook)
+    # CryptoPay webhook — секретный путь
+    CRYPTO_PATH = _crypto_secret_path()
+    app.router.add_post(CRYPTO_PATH, _handle_cryptobot_webhook)
+    log.info("CryptoPay webhook path: %s", CRYPTO_PATH)
 
     # MonoPay webhook
     app.router.add_post(settings.MONOPAY_WEBHOOK_PATH, _handle_monopay_webhook)
 
     async def on_app_start(app_):
         await on_startup(bot)
-
-        # безопасно пытаемся настроить CryptoBot вебхук
-        try:
-            await _ensure_crypto_webhook()
-        except Exception as e:
-            logging.error("Crypto webhook init skipped: %s", e)
 
         # Telegram webhook
         wh_url = (settings.WEBHOOK_URL or "").rstrip("/") + settings.WEBHOOK_PATH
@@ -300,9 +288,11 @@ async def webhook():
     while True:
         await asyncio.sleep(3600)
 
+
 if __name__ == "__main__":
     if "--polling" in sys.argv:
         asyncio.run(polling())
     else:
         asyncio.run(webhook())
+
 
