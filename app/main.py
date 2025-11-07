@@ -57,24 +57,43 @@ def _verify_mono_xsign(pubkey_pem: bytes, body: bytes, x_sign_b64: str) -> bool:
     except Exception:
         return False
 
+# --- CryptoBot webhook через HTTP (без падений)
+import logging
+import aiohttp
+
+CRYPTO_BASE = "https://pay.crypt.bot/api"
+
 async def _ensure_crypto_webhook():
+    """
+    Ставит вебхук для CryptoBot через HTTP API.
+    Никогда не валит процесс — только логирует результат.
+    """
     if not settings.CRYPTO_PAY_TOKEN or not settings.WEBHOOK_URL:
+        logging.info("Crypto webhook: пропускаю (нет CRYPTO_PAY_TOKEN или WEBHOOK_URL)")
         return
+
     url = (settings.WEBHOOK_URL or "").rstrip("/") + settings.CRYPTO_WEBHOOK_PATH
-    crypto = AioCryptoPay(
-        token=settings.CRYPTO_PAY_TOKEN,
-        network=Networks.TEST_NET if settings.TEST_MODE else Networks.MAIN_NET
-    )
+    headers = {
+        "Crypto-Pay-API-Token": settings.CRYPTO_PAY_TOKEN,
+        "Content-Type": "application/json",
+    }
+    payload = {"url": url}
+
     try:
-        await crypto.set_webhook(url)   # регистрируем /cryptobot
-    finally:
-        await crypto.close()
+        async with aiohttp.ClientSession() as s:
+            async with s.post(f"{CRYPTO_BASE}/setWebhook", headers=headers, json=payload, timeout=15) as r:
+                text = await r.text()
+                if r.status == 200:
+                    logging.info("Crypto webhook: установлен %s (%s)", url, text)
+                else:
+                    logging.error("Crypto webhook: статус %s, ответ: %s", r.status, text)
+    except Exception as e:
+        logging.error("Crypto webhook: не удалось установить (%s). Продолжаю без автонстройки.", e)
 
 
 async def on_startup(bot: Bot):
     await connect()
     await ensure_schema()
-    await _ensure_crypto_webhook()
     try:
         await run_stars_migration()
     except Exception:
@@ -229,12 +248,21 @@ async def webhook():
     # MonoPay webhook
     app.router.add_post(settings.MONOPAY_WEBHOOK_PATH, _handle_monopay_webhook)
 
-    async def on_app_start(_):
+    async def on_app_start(app_):
         await on_startup(bot)
+
+    # безопасно пытаемся настроить CryptoBot вебхук
+        try:
+            await _ensure_crypto_webhook()
+        except Exception as e:
+            logging.error("Crypto webhook init skipped: %s", e)
+
+    # Telegram webhook
         wh_url = (settings.WEBHOOK_URL or "").rstrip("/") + settings.WEBHOOK_PATH
         await bot.delete_webhook(drop_pending_updates=True)
         updates = dp.resolve_used_update_types()
         await bot.set_webhook(wh_url, drop_pending_updates=True, allowed_updates=updates)
+
 
     async def on_app_stop(_):
         await on_shutdown(bot)
