@@ -1,271 +1,251 @@
 from aiogram import Router, F
-from aiogram.types import Message, CallbackQuery
-from aiogram.filters import CommandStart, Command
+from aiogram.types import Message, CallbackQuery, ReplyKeyboardRemove
+from aiogram.filters import CommandStart
 from ..utils.i18n import i18n
 from ..utils.keyboards import lang_kb, activation_kb, main_menu_kb
-from ..services.tasks_service import ensure_user, set_language, get_user, award_referral_if_needed, activate_user
+from ..services.tasks_service import (
+    ensure_user, set_language, get_user,
+    award_referral_if_needed, activate_user
+)
 from ..config import settings
-from ..utils.payments import create_invoice as cc_create, get_invoices_info
 from ..db import execute, fetchrow
-from ..services.tasks_service import create_invoice as db_create_invoice, set_payment_status
 from ..utils.tg import replace_message
-from aiogram.types import ReplyKeyboardRemove
+
+# Новые провайдеры оплаты
+from ..utils.payments import (
+    create_monopay_invoice,
+    create_cryptobot_invoice,
+    get_cryptobot_invoice
+)
+
 import time
-from aiogram.types import PreCheckoutQuery
-from aiogram.types import LabeledPrice
+import re
+
 router = Router()
 
+# ======= Антидубль /start =======
 _last_start = {}  # user_id -> ts
-
 DEBOUNCE_SEC = 1.2
 
+
+# ======= Утилиты =======
 def parse_ref(payload: str | None) -> int | None:
+    """
+    Принимает варианты: 'start=<tg_id>', '<tg_id>', 'payloaddigits'
+    """
     if not payload:
         return None
-    # Accept formats: "start=<tg_id>", "<tg_id>", "payloaddigits"
-    import re
     m = re.search(r"(?:start=)?(\d{5,})", payload)
-    if m:
-        try:
-            return int(m.group(1))
-        except ValueError:
-            return None
-    return None
+    if not m:
+        return None
+    try:
+        return int(m.group(1))
+    except ValueError:
+        return None
 
+
+async def _get_or_create_invoices(user_row, locale_code: str):
+    """
+    Возвращает ссылки pay_url_mono, pay_url_crypto.
+    Если актуальных инвойсов нет — создаёт и сохраняет их в БД.
+    """
+    user_id = user_row["id"]
+    tg_id = user_row["tg_id"]
+
+    # 1) пробуем найти свежие "created/pending"
+    mono = await fetchrow(
+        """SELECT link, uuid FROM payments
+           WHERE user_id=$1 AND provider='monopay' AND status IN ('created','pending')
+           ORDER BY id DESC LIMIT 1""",
+        user_id,
+    )
+    crypto = await fetchrow(
+        """SELECT link, uuid FROM payments
+           WHERE user_id=$1 AND provider='cryptobot' AND status IN ('created','pending')
+           ORDER BY id DESC LIMIT 1""",
+        user_id,
+    )
+
+    pay_url_mono = mono["link"] if mono else None
+    pay_url_crypto = crypto["link"] if crypto else None
+
+    # 2) если нет — создаём
+    order_suffix = str(int(time.time()))
+    description = "Activation"
+
+    if not pay_url_mono and settings.MONOPAY_TOKEN:
+        inv_mono = await create_monopay_invoice(
+            order_id=f"ACT-MONO:{tg_id}:{order_suffix}",
+            description=description
+        )
+        await execute(
+            """INSERT INTO payments (user_id, provider, uuid, link, status, currency, amount_usd, order_id)
+               VALUES ($1,'monopay',$2,$3,'created','UAH',$4,$5)""",
+            user_id, inv_mono.invoice_id, inv_mono.pay_url, settings.PRICE_USD,
+            f"ACT-MONO:{tg_id}:{order_suffix}",
+        )
+        pay_url_mono = inv_mono.pay_url
+
+    if not pay_url_crypto and settings.CRYPTO_PAY_TOKEN:
+        inv_crypto = await create_cryptobot_invoice(
+            order_id=f"ACT-CRYPTO:{tg_id}:{order_suffix}",
+            description=description
+        )
+        await execute(
+            """INSERT INTO payments (user_id, provider, uuid, link, status, currency, amount_usd, order_id)
+               VALUES ($1,'cryptobot',$2,$3,'created','USD',$4,$5)""",
+            user_id, inv_crypto.invoice_id, inv_crypto.pay_url, settings.PRICE_USD,
+            f"ACT-CRYPTO:{tg_id}:{order_suffix}",
+        )
+        pay_url_crypto = inv_crypto.pay_url
+
+    return pay_url_mono, pay_url_crypto
+
+
+async def _activation_screen(message_or_cb, texts, pay_url_mono: str | None, pay_url_crypto: str | None):
+    """
+    Показывает экран активации с двумя URL-кнопками (MonoPay/CryptoBot) и кнопкой «Я оплатил».
+    """
+    if hasattr(message_or_cb, "answer") and hasattr(message_or_cb, "message_id"):
+        await message_or_cb.answer("\u2063", reply_markup=ReplyKeyboardRemove())
+        await message_or_cb.answer(
+            f"<b>{texts.get('activate_title', 'Активация')}</b>\n{texts.get('activate_text', 'Оплатите и доступ откроется автоматически.')}",
+            reply_markup=activation_kb(pay_url_mono, pay_url_crypto, texts),
+        )
+    else:
+        # cb.message
+        await message_or_cb.message.answer("\u2063", reply_markup=ReplyKeyboardRemove())
+        await replace_message(
+            message_or_cb.message,
+            f"<b>{texts.get('activate_title', 'Активация')}</b>\n{texts.get('activate_text', 'Оплатите и доступ откроется автоматически.')}",
+            reply_markup=activation_kb(pay_url_mono, pay_url_crypto, texts),
+        )
+
+
+# ======= /start =======
 @router.message(CommandStart())
 async def on_start(msg: Message):
     now = time.time()
     ts = _last_start.get(msg.from_user.id, 0)
     if now - ts < DEBOUNCE_SEC:
-        return  # ігноруємо дубльований /start
+        return  # игнорируем дубль
     _last_start[msg.from_user.id] = now
 
-    # 1) фіксуємо можливого реферала
+    # реферал из payload
     payload = msg.text.split(maxsplit=1)[1] if msg.text and len(msg.text.split()) > 1 else None
     ref = parse_ref(payload)
     user = await ensure_user(msg.from_user.id, referrer_tg=ref)
 
-    # 2) немає мови → показуємо вибір (інлайни), попередньо скидаємо reply-клаву
+    # если язык ещё не выбран — покажем выбор
     if not user["language"]:
         await msg.answer("\u2063", reply_markup=ReplyKeyboardRemove())
         await msg.answer(i18n.t("en", "lang_prompt"), reply_markup=lang_kb())
         return
 
-    # 3) якщо не активний → екран активації з кнопкою "Оплатити $1" (якщо інвойс вже є)
+    # если не активирован — экран активации
     if user["status"] != "active":
         lang = user["language"]
         texts = i18n._texts[lang]
-
-        inv = await fetchrow(
-            "SELECT link FROM payments WHERE user_id=$1 AND status='created' ORDER BY id DESC LIMIT 1",
-            user["id"],
-        )
-        pay_url = inv["link"] if inv else None
-
-        # прибираємо залиплу reply-клаву й показуємо інлайн-кнопки активації
-        await msg.answer("\u2063", reply_markup=ReplyKeyboardRemove())
-        await msg.answer(
-            f"<b>{texts['activate_title']}</b>\n{texts['activate_text']}",
-            reply_markup=activation_kb(pay_url, texts),
-        )
+        pay_url_mono, pay_url_crypto = await _get_or_create_invoices(user, lang)
+        await _activation_screen(msg, texts, pay_url_mono, pay_url_crypto)
         return
 
-    # 4) активний → показуємо ГОЛОВНЕ МЕНЮ з reply-клавою
+    # активен → главное меню
     lang = user["language"]
     texts = i18n._texts[lang]
     await msg.answer(texts["main_menu"], reply_markup=main_menu_kb(texts))
 
-@router.callback_query(F.data == "pay:stars")
-async def pay_stars(cb: CallbackQuery):
-    user = await get_user(cb.from_user.id)
-    payload = f"ACT-STAR:{user['tg_id']}:{int(time.time())}"  # наш order_id
 
-    await cb.message.bot.send_invoice(
-        chat_id=cb.from_user.id,
-        title=settings.STARS_TITLE,
-        description=settings.STARS_DESCRIPTION,
-        payload=payload,
-        currency="XTR",                                   # Telegram Stars
-        prices=[LabeledPrice(label=settings.STARS_TITLE, amount=int(settings.STARS_PRICE_XTR))],
-        provider_token="",                                # для XTR не потрібен
-    )
-    await cb.answer()
-
-@router.pre_checkout_query()
-async def on_pre_checkout(pcq: PreCheckoutQuery):
-    payload = pcq.invoice_payload or ""
-    if pcq.currency != "XTR" or not payload.startswith("ACT-STAR:"):
-        await pcq.answer(ok=False, error_message="Invalid payment payload")
-        return
-    await pcq.answer(ok=True)
-
-
-
+# ======= Выбор языка =======
 @router.callback_query(F.data.startswith("lang:"))
-async def set_lang(cb: CallbackQuery):
+async def set_lang_cb(cb: CallbackQuery):
     code = cb.data.split(":")[1]
 
-    # 1) зберігаємо мову (якщо є така функція; якщо ні — прибери try/except)
+    # сохраняем язык пользователя (если функция есть)
     try:
-        from ..services.tasks_service import set_language  # локальний імпорт, якщо є
         await set_language(cb.from_user.id, code)
     except Exception:
         pass
 
-    # 2) гарантуємо наявність юзера БЕЗ referrer_tg_id
-    user = await get_user(cb.from_user.id)
-    if not user:
-        user = await ensure_user(cb.from_user.id)
-
+    # гарантируем пользователя
+    user = await get_user(cb.from_user.id) or await ensure_user(cb.from_user.id)
     texts = i18n._texts[code]
-    pay_url_crypto = None
 
-    # 3) створюємо інвойс CryptoCloud (як і раніше) і кладемо його в БД
-    if not settings.TEST_MODE:
-        inv = await cc_create(
-            amount_usd=settings.CRYPTOCLOUD_PRICE_USD,
-            order_id=f"ACT-CC-{user['tg_id']}",
-            description="Activation",
-            locale=code,
-        )
-        # твій utils/payments.create_invoice повертає {"uuid","link"}
-        cc_uuid = inv["uuid"]
-        cc_link = inv["link"]
-        pay_url_crypto = cc_link
+    # создаём (или берём) инвойсы для выбранного языка
+    pay_url_mono, pay_url_crypto = await _get_or_create_invoices(user, code)
 
-        await execute("""
-            INSERT INTO payments (user_id, provider, uuid, link, status, amount_usd, currency)
-            VALUES ($1,'cryptocloud',$2,$3,'created',$4,'USD')
-        """, user["id"], cc_uuid, cc_link, settings.CRYPTOCLOUD_PRICE_USD)
-
-    # 4) показуємо екран активації з двома кнопками:
-    #    ⭐️ Stars (callback "pay:stars") та CryptoCloud (url)
-    await cb.message.answer("\u2063", reply_markup=ReplyKeyboardRemove())  # скинути reply-клаву
+    # экран активации
+    await cb.message.answer("\u2063", reply_markup=ReplyKeyboardRemove())
     await replace_message(
         cb.message,
-        f"<b>{texts['activate_title']}</b>\n\n{texts['activate_text']}",
-        reply_markup=activation_kb(pay_url_crypto, texts, include_stars=settings.STARS_ENABLED),
+        f"<b>{texts.get('activate_title', 'Активация')}</b>\n\n{texts.get('activate_text', 'Оплатите и доступ откроется автоматически.')}",
+        reply_markup=activation_kb(pay_url_mono, pay_url_crypto, texts),
     )
     await cb.answer()
 
 
-@router.message(F.successful_payment)
-async def on_successful_payment(msg: Message):
-    sp = msg.successful_payment
+# ======= Ручная проверка оплаты («Я оплатил») =======
+async def _check_paid_and_activate(user_row) -> bool:
+    """
+    Унифицированная логика для 'activation:check' и 'paid_check'.
+    1) Сначала ищем уже 'paid' в БД (MonoPay/CryptoBot) — это основной путь через вебхуки.
+    2) Если нет — пробуем подтянуть статус последнего инвойса CryptoBot по API.
+       (MonoPay статус тянем вебхуком: подпись X-Sign проверяет сервер.)
+    """
+    # 1) есть ли уже paid?
+    paid = await fetchrow(
+        """SELECT 1 FROM payments
+           WHERE user_id=$1 AND status='paid'
+           ORDER BY id DESC LIMIT 1""",
+        user_row["id"],
+    )
+    if paid:
+        await execute("UPDATE users SET status='active' WHERE id=$1", user_row["id"])
+        await award_referral_if_needed(user_row["tg_id"])
+        return True
 
-    # Працюємо тільки з Telegram Stars
-    if (sp.currency or "").upper() != "XTR":
-        return
+    # 2) CryptoBot: проверим по API последний созданный инвойс
+    inv_crypto = await fetchrow(
+        """SELECT uuid FROM payments
+           WHERE user_id=$1 AND provider='cryptobot' AND status IN ('created','pending')
+           ORDER BY id DESC LIMIT 1""",
+        user_row["id"],
+    )
+    if inv_crypto and inv_crypto["uuid"]:
+        try:
+            info = await get_cryptobot_invoice(inv_crypto["uuid"])
+            status = (getattr(info, "status", None) or "").lower()
+            if status in ("paid", "completed"):
+                await execute("UPDATE payments SET status='paid' WHERE uuid=$1", inv_crypto["uuid"])
+                await execute("UPDATE users SET status='active' WHERE id=$1", user_row["id"])
+                await award_referral_if_needed(user_row["tg_id"])
+                return True
+        except Exception:
+            # молча даём вебхуку завершить
+            pass
 
-    # order_id беремо з payload (який ти подавав у send_invoice), резерв — charge_id
-    order_id = sp.invoice_payload or sp.provider_payment_charge_id or sp.telegram_payment_charge_id
-    if not order_id or not str(order_id).startswith("ACT-STAR:"):
-        return  # не наша активація
+    return False
 
-    # гарантуємо юзера
-    user = await get_user(msg.from_user.id) or await ensure_user(msg.from_user.id)
-
-    # Записуємо платіж (idempotent через ON CONFLICT)
-    # amount_usd ставимо NULL (бо це "зірковий" платіж), а uuid кладемо = order_id для сумісності
-    await execute("""
-        INSERT INTO payments (user_id, provider, order_id, uuid, status, currency, amount_stars, amount_usd)
-        VALUES ($1, 'stars', $2, $2, 'paid', 'XTR', $3, NULL)
-        ON CONFLICT (provider, order_id)
-        DO UPDATE SET status='paid',
-                      amount_stars=EXCLUDED.amount_stars,
-                      updated_at=NOW()
-    """, user["id"], order_id, sp.total_amount)
-
-    # Активуємо доступ + реферал-бонус (твоя існуюча логіка)
-    await activate_user(msg.from_user.id)
-    await award_referral_if_needed(msg.from_user.id)
-
-    # Відповідь і меню
-    lang = (user.get("language") or "en")
-    texts = i18n._texts[lang]
-    await msg.answer(texts.get("activated", "✅ Доступ активовано."))
-    await msg.answer(texts["main_menu"], reply_markup=main_menu_kb(texts))
 
 @router.callback_query(F.data == "activation:check")
 async def activation_check(cb: CallbackQuery):
     user = await get_user(cb.from_user.id)
     if user["status"] == "active":
-        await cb.answer("Вже активовано ✅", show_alert=True)
+        await cb.answer("Уже активировано ✅", show_alert=True)
         return
 
-    ok = False
-
-    # 1) Раптом вже прийшов successful_payment (Stars)
-    row_star = await fetchrow("""
-        SELECT 1 FROM payments
-         WHERE user_id=$1 AND provider='stars' AND status='paid'
-         ORDER BY id DESC LIMIT 1
-    """, user["id"])
-    if row_star:
-        ok = True
-
-    # 2) Якщо ні — перевіряємо CryptoCloud
-    if not ok:
-        inv = await fetchrow("""
-            SELECT uuid FROM payments
-             WHERE user_id=$1 AND provider='cryptocloud' AND status='created'
-             ORDER BY id DESC LIMIT 1
-        """, user["id"])
-        if inv and inv["uuid"]:
-            try:
-                info = await get_invoices_info([inv["uuid"]])   # список інвойсів
-                status = (info[0].get("status") or "").lower() if info else ""
-                if status in ("paid", "overpaid", "partial"):
-                    ok = True
-                    await execute("UPDATE payments SET status='paid' WHERE uuid=$1", inv["uuid"])
-            except Exception:
-                pass
-
-    if settings.TEST_MODE:
-        ok = True
+    ok = await _check_paid_and_activate(user)
+    texts = i18n._texts[user["language"] or "en"]
 
     if ok:
-        await execute("UPDATE users SET status='active' WHERE id=$1", user["id"])
         await cb.answer("Готово ✅", show_alert=True)
-        texts = i18n._texts[user["language"]]
-        await replace_message(cb.message, texts["activated"])
+        await replace_message(cb.message, texts.get("activated", "✅ Доступ активирован."))
         await cb.message.answer(texts["main_menu"], reply_markup=main_menu_kb(texts))
     else:
-        await cb.answer("Платіж ще не підтверджено, спробуйте пізніше 🙏", show_alert=True)
+        await cb.answer(texts.get("not_confirmed", "Платёж ещё не подтверждён, попробуйте позже 🙏"), show_alert=True)
 
 
-@router.callback_query(F.data=='paid_check')
-async def on_paid(cb: CallbackQuery):
-    user = await get_user(cb.from_user.id)
-    lang = user['language'] or 'en'
-    texts = i18n._texts[lang]
-
-    if settings.TEST_MODE:
-        await activate_user(cb.from_user.id)
-        await award_referral_if_needed(cb.from_user.id)
-        await replace_message(cb.message, texts['activated'])
-        # показуємо меню
-        await cb.message.answer(texts['main_menu'], reply_markup=main_menu_kb(texts))
-        await cb.answer()
-        return
-
-    inv = await fetchrow("SELECT * FROM payments WHERE user_id=$1 ORDER BY id DESC LIMIT 1", user["id"])
-    if not inv:
-        await cb.answer("No invoice.")
-        return
-
-    data = await get_invoices_info([inv['uuid']])
-    status = None
-    if isinstance(data, list) and data:
-        status = data[0].get('status') or data[0].get('status_invoice')
-
-    if status in ('paid','overpaid','partial'):
-        await set_payment_status(inv['uuid'], status)
-        await activate_user(cb.from_user.id)
-        await award_referral_if_needed(cb.from_user.id)
-        await replace_message(cb.message, texts['activated'])
-        # меню після активації
-        await cb.message.answer(texts['main_menu'], reply_markup=main_menu_kb(texts))
-    else:
-        await cb.answer(texts['not_confirmed'], show_alert=True)
-
+# Сохраняем старый хендлер имени, чтобы ничего не отвалилось в меню/кнопках
+@router.callback_query(F.data == "paid_check")
+async def paid_check_alias(cb: CallbackQuery):
+    await activation_check(cb)
