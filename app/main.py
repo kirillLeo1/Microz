@@ -10,9 +10,9 @@ from .config import settings
 from .db import connect, close, execute, fetchrow
 from .schema import ensure_schema, run_stars_migration
 from .handlers import start, profile, tasks, withdraw, admin
-from aiocryptopay import AioCryptoPay, Networks  # оставляю для совместимости с payments.py
+from aiocryptopay import AioCryptoPay, Networks  # лишаю для payments.py
 
-# === NEW: для верификации подписи MonoPay
+# === для верификации подписи MonoPay
 import ecdsa  # pip install ecdsa
 
 logging.basicConfig(level=logging.INFO)
@@ -75,7 +75,6 @@ def _verify_mono_xsign(pubkey_pem: bytes, body: bytes, x_sign_b64: str) -> bool:
     Проверяем оба варианта.
     """
     try:
-        # base64 с возможным отсутствующим паддингом
         s = x_sign_b64.strip()
         pad = (-len(s)) % 4
         if pad:
@@ -89,14 +88,13 @@ def _verify_mono_xsign(pubkey_pem: bytes, body: bytes, x_sign_b64: str) -> bool:
     except Exception:
         return False
 
-    # 1) Пытаемся как DER
+    # 1) DER
     try:
         if vk.verify(sig, body, sigdecode=ecdsa.util.sigdecode_der, hashfunc=hashlib.sha256):
             return True
     except Exception:
         pass
-
-    # 2) Пытаемся как "raw" r||s (64 байта)
+    # 2) RAW r||s
     try:
         if len(sig) == 64 and vk.verify(sig, body, sigdecode=ecdsa.util.sigdecode_string, hashfunc=hashlib.sha256):
             return True
@@ -106,22 +104,35 @@ def _verify_mono_xsign(pubkey_pem: bytes, body: bytes, x_sign_b64: str) -> bool:
     return False
 
 
-
-# --- CryptoPay: «секретный» путь вебхука (по рекомендации доков, и без setWebhook через API)
+# --- CryptoPay: «секретный» путь вебхука
 def _crypto_secret_path() -> str:
-    """
-    Формирует секретный путь для вебхука Crypto Pay.
-    Если в .env задан CRYPTO_WEBHOOK_PATH и он не '/cryptobot' — используем его как есть.
-    Иначе строим '/cryptobot/<sha256(token)[:24]>'.
-    """
     if settings.CRYPTO_WEBHOOK_PATH and settings.CRYPTO_WEBHOOK_PATH != "/cryptobot":
         return settings.CRYPTO_WEBHOOK_PATH
     slug = hashlib.sha256((settings.CRYPTO_PAY_TOKEN or "no-token").encode()).hexdigest()[:24]
     return f"/cryptobot/{slug}"
 
 
+# --- Надёжное подключение к БД с ретраями (щоб Railway не валив процес)
+async def _connect_db_with_retry(max_tries: int = 8) -> None:
+    delay = 0.5
+    last_err = None
+    for i in range(1, max_tries + 1):
+        try:
+            await connect()
+            if i > 1:
+                log.info("DB connected on try %s", i)
+            return
+        except Exception as e:
+            last_err = e
+            log.warning("DB connect failed (try %s/%s): %s", i, max_tries, e)
+            await asyncio.sleep(delay)
+            delay = min(delay * 2, 8.0)
+    # если так и не смогли — бросаем дальше (пусть Railway ретраит контейнер)
+    raise last_err
+
+
 async def on_startup(bot: Bot):
-    await connect()
+    await _connect_db_with_retry()   # <— вот тут ретраи вместо прямого connect()
     await ensure_schema()
     try:
         await run_stars_migration()
@@ -133,7 +144,7 @@ async def on_startup(bot: Bot):
         BotCommand(command="help", description="Help"),
         BotCommand(command="admin", description="Admin panel"),
     ])
-    # На старте заранее подтянем ключ (если токен задан)
+    # заранее подтянем ключ Mono (если токен задан)
     if settings.MONOPAY_TOKEN:
         try:
             await _fetch_mono_pubkey_pem()
@@ -184,7 +195,6 @@ async def _verify_crypto_signature(req: web.Request, body: bytes) -> bool:
 
 async def _handle_cryptobot_webhook(request: web.Request):
     body = await request.read()
-    # Если есть токен — валидируем подпись (как в доках)
     if settings.CRYPTO_PAY_TOKEN:
         if not await _verify_crypto_signature(request, body):
             return web.Response(status=403, text="bad signature")
@@ -194,7 +204,6 @@ async def _handle_cryptobot_webhook(request: web.Request):
         payload = data.get("payload") or {}
         inv = str(payload.get("invoice_id"))
 
-        # отмечаем платёж и активируем пользователя
         await execute("UPDATE payments SET status='paid' WHERE provider='cryptobot' AND uuid=$1", inv)
         row = await fetchrow("SELECT user_id FROM payments WHERE provider='cryptobot' AND uuid=$1", inv)
         if row:
@@ -206,16 +215,15 @@ async def _handle_cryptobot_webhook(request: web.Request):
 
 async def _handle_monopay_webhook(request: web.Request):
     """
-    Жёсткая проверка подписи X-Sign по ECDSA SHA-256.
-    Если не ОК — 403 (monobank ретраит несколько раз).
-    После валидации меняем статус платежа и активируем юзера.
+    Жёсткая проверка X-Sign (ECDSA, допускаем DER и RAW r||s).
+    На success — помечаем платёж и активируем пользователя.
     """
     raw = await request.read()
     x_sign = request.headers.get("X-Sign") or request.headers.get("x-sign")
     if not x_sign:
         return web.Response(status=403, text="no signature")
 
-    # 1) верифицируем подпись; при фейле 1 раз обновим ключ и попробуем снова (ротация у банка)
+    # 1) верифицируем подпись; при фейле один раз обновим ключ (возможна ротация)
     try:
         pubkey_pem = await _fetch_mono_pubkey_pem()
         ok = _verify_mono_xsign(pubkey_pem, raw, x_sign)
@@ -232,7 +240,6 @@ async def _handle_monopay_webhook(request: web.Request):
         log.warning("Mono webhook: invalid X-Sign")
         return web.Response(status=403, text="bad signature")
 
-    # 2) подпись валидна — обрабатываем
     data = json.loads(raw.decode("utf-8"))
     status = (data.get("status") or "").lower()
     info = data.get("merchantPaymInfo") or {}
@@ -240,13 +247,11 @@ async def _handle_monopay_webhook(request: web.Request):
     invoice_id = data.get("invoiceId") or data.get("invoice_id")
 
     if status == "success":
-        # помечаем платёж
         await execute("""
             UPDATE payments SET status='paid'
             WHERE provider='monopay' AND (uuid=$1 OR uuid=$2 OR order_id=$3)
         """, str(invoice_id), str(reference), str(reference))
 
-        # активируем пользователя
         row = await fetchrow("""
             SELECT user_id FROM payments
             WHERE provider='monopay' AND (uuid=$1 OR uuid=$2 OR order_id=$3)
@@ -320,5 +325,3 @@ if __name__ == "__main__":
         asyncio.run(polling())
     else:
         asyncio.run(webhook())
-
-
