@@ -11,8 +11,6 @@ router = Router()
 class WState:
     stage = {}  # user_id -> 'country' | 'method' | 'details' | 'amount'
     data = {}   # user_id -> {'country':..., 'method':..., 'details':..., 'amount_qc':...}
-    
-MIN_WITHDRAW = settings.MIN_WITHDRAW
 
 async def notify_admins_withdrawal(bot, user_row, wd_row, username: str | None):
     """
@@ -70,7 +68,7 @@ async def withdraw_entry(msg: Message):
     lang = user["language"]
 
     # проверяем минималку
-    if user["balance_qc"] < MIN_WITHDRAW:
+    if user["balance_qc"] < 10000:
         # ключ в локалях должен поддерживать плейсхолдер {min}
         await msg.answer(i18n.t(lang, "withdraw_min", min=MIN_WITHDRAW))
         return
