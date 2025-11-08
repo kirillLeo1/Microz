@@ -32,43 +32,49 @@ _MONO_PUBKEY_OBJ = None  # ec.EllipticCurvePublicKey
 
 def _try_parse_pubkey_from_text(text: str) -> bytes | None:
     """
-    Приймає будь-який текст: PEM ключ, PEM сертифікат, JSON з полем ключа, base64/urlsafe-base64 DER ключ/сертифікат.
-    Повертає PEM публічного ключа (bytes) або None, якщо не вдалося.
+    Принимает: PEM ключ, PEM сертификат, JSON с полем ключа,
+    base64/url-safe base64 DER (ключ/сертификат),
+    И ТАКЖЕ base64 от PEM (твой кейс).
+    Возвращает PEM публичного ключа (bytes) или None.
     """
-    s = text.strip().strip('"')
+    s = (text or "").strip().strip('"')
 
-    # 1) JSON обгортка { "key": "..."} / {"pubkey": "..."} / {"data": "..."}
+    # поддержка "одной строки" PEM с \n
+    if "\\n" in s and "BEGIN " in s:
+        s = s.replace("\\n", "\n")
+
+    # 1) JSON-обёртка
     try:
         j = json.loads(s)
         s = str(j.get("key") or j.get("pubkey") or j.get("data") or s).strip()
     except Exception:
         pass
 
-    # 2) Якщо це PEM публічний ключ — відразу повертаємо
+    # 2) Уже PEM public key?
     if "BEGIN PUBLIC KEY" in s:
         return s.encode()
 
-    # 3) Якщо це PEM сертифікат — витягуємо публічний ключ з серта
+    # 3) PEM сертификат -> достаём ключ
     if "BEGIN CERTIFICATE" in s:
         try:
+            from cryptography.x509 import load_pem_x509_certificate
+            from cryptography.hazmat.primitives import serialization
             cert = load_pem_x509_certificate(s.encode())
             pk = cert.public_key()
-            pem = pk.public_bytes(
+            return pk.public_bytes(
                 encoding=serialization.Encoding.PEM,
                 format=serialization.PublicFormat.SubjectPublicKeyInfo,
             )
-            return pem
         except Exception:
             return None
 
-    # 4) Спробуємо як base64/urlsafe-base64 DER (ключ або сертифікат)
+    # 4) Пробуем как base64/url-safe base64
     def _b64decode_any(b64s: str) -> bytes | None:
-        # нормальний b64
+        b64s = "".join(b64s.split())  # убираем пробелы/переносы
         try:
             pad = (-len(b64s)) % 4
             return base64.b64decode(b64s + ("=" * pad if pad else ""))
         except Exception:
-            # urlsafe
             try:
                 pad = (-len(b64s)) % 4
                 b64s2 = b64s.replace("-", "+").replace("_", "/") + ("=" * pad if pad else "")
@@ -80,26 +86,44 @@ def _try_parse_pubkey_from_text(text: str) -> bytes | None:
     if not raw:
         return None
 
-    # 4а) як DER-публічний ключ
+    # 4a) вдруг это base64-от-PEM (декод получился текстом с -----BEGIN ...)
     try:
-        pk = serialization.load_der_public_key(raw)
-        pem = pk.public_bytes(
-            encoding=serialization.Encoding.PEM,
-            format=serialization.PublicFormat.SubjectPublicKeyInfo,
-        )
-        return pem
+        txt = raw.decode("utf-8", "ignore")
+        if "BEGIN PUBLIC KEY" in txt:
+            return txt.encode()
+        if "BEGIN CERTIFICATE" in txt:
+            from cryptography.x509 import load_pem_x509_certificate
+            from cryptography.hazmat.primitives import serialization
+            cert = load_pem_x509_certificate(txt.encode())
+            pk = cert.public_key()
+            return pk.public_bytes(
+                encoding=serialization.Encoding.PEM,
+                format=serialization.PublicFormat.SubjectPublicKeyInfo,
+            )
     except Exception:
         pass
 
-    # 4б) як DER-сертифікат
+    # 4b) DER public key
     try:
-        cert = load_der_x509_certificate(raw)
-        pk = cert.public_key()
-        pem = pk.public_bytes(
+        from cryptography.hazmat.primitives import serialization
+        pk = serialization.load_der_public_key(raw)
+        return pk.public_bytes(
             encoding=serialization.Encoding.PEM,
             format=serialization.PublicFormat.SubjectPublicKeyInfo,
         )
-        return pem
+    except Exception:
+        pass
+
+    # 4c) DER certificate
+    try:
+        from cryptography.x509 import load_der_x509_certificate
+        from cryptography.hazmat.primitives import serialization
+        cert = load_der_x509_certificate(raw)
+        pk = cert.public_key()
+        return pk.public_bytes(
+            encoding=serialization.Encoding.PEM,
+            format=serialization.PublicFormat.SubjectPublicKeyInfo,
+        )
     except Exception:
         pass
 
