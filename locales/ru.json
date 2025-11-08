@@ -22,7 +22,7 @@
   "status_active": "Active",
   "status_inactive": "Inactive",
   "ref_link": "Ваша реф-ссылка:\nhttps://t.me/{bot}?start={tg_id}",
-  "withdraw_min": "Минимум для вывода — 1000 QC ($5).",
+  "withdraw_min": "Минимум для вывода — 10000 QC ($50).",
   "withdraw_start": "Заявка на вывод: укажите страну (ввод текстом):",
   "withdraw_method": "Способ получения: выберите",
   "withdraw_crypto": "Криптовалюта",
