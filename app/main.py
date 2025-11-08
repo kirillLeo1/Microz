@@ -1,4 +1,4 @@
-import asyncio, sys, logging, os, hmac, hashlib, json, base64, aiohttp
+import asyncio, sys, logging, hmac, hashlib, json, base64, os, aiohttp
 from aiohttp import web
 from aiogram import Bot, Dispatcher
 from aiogram.types import BotCommand
@@ -10,11 +10,12 @@ from .config import settings
 from .db import connect, close, execute, fetchrow
 from .schema import ensure_schema, run_stars_migration
 from .handlers import start, profile, tasks, withdraw, admin
-from aiocryptopay import AioCryptoPay, Networks  # для payments.py
+from aiocryptopay import AioCryptoPay, Networks  # лишаю для payments.py
 
-# cryptography — для надёжной валидации MonoPay (DER/RAW + urlsafe b64)
+# cryptography — надійна валідація MonoPay (DER/RAW + urlsafe b64) і парс PEM/DER ключа/сертифіката
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import ec, utils
+from cryptography.x509 import load_pem_x509_certificate, load_der_x509_certificate
 from cryptography.exceptions import InvalidSignature
 
 logging.basicConfig(level=logging.INFO)
@@ -22,17 +23,110 @@ log = logging.getLogger("main")
 
 MONO_BASE = "https://api.monobank.ua"
 
-# Кеш публичного ключа Mono
+# Кеш публічного ключа Mono
 _MONO_PUBKEY_PEM: bytes | None = None
 _MONO_PUBKEY_OBJ = None  # ec.EllipticCurvePublicKey
 
 
-# ---------------- Mono: загрузка/кеш ключа ----------------
+# ===================== Mono: робота з публічним ключем =====================
+
+def _try_parse_pubkey_from_text(text: str) -> bytes | None:
+    """
+    Приймає будь-який текст: PEM ключ, PEM сертифікат, JSON з полем ключа, base64/urlsafe-base64 DER ключ/сертифікат.
+    Повертає PEM публічного ключа (bytes) або None, якщо не вдалося.
+    """
+    s = text.strip().strip('"')
+
+    # 1) JSON обгортка { "key": "..."} / {"pubkey": "..."} / {"data": "..."}
+    try:
+        j = json.loads(s)
+        s = str(j.get("key") or j.get("pubkey") or j.get("data") or s).strip()
+    except Exception:
+        pass
+
+    # 2) Якщо це PEM публічний ключ — відразу повертаємо
+    if "BEGIN PUBLIC KEY" in s:
+        return s.encode()
+
+    # 3) Якщо це PEM сертифікат — витягуємо публічний ключ з серта
+    if "BEGIN CERTIFICATE" in s:
+        try:
+            cert = load_pem_x509_certificate(s.encode())
+            pk = cert.public_key()
+            pem = pk.public_bytes(
+                encoding=serialization.Encoding.PEM,
+                format=serialization.PublicFormat.SubjectPublicKeyInfo,
+            )
+            return pem
+        except Exception:
+            return None
+
+    # 4) Спробуємо як base64/urlsafe-base64 DER (ключ або сертифікат)
+    def _b64decode_any(b64s: str) -> bytes | None:
+        # нормальний b64
+        try:
+            pad = (-len(b64s)) % 4
+            return base64.b64decode(b64s + ("=" * pad if pad else ""))
+        except Exception:
+            # urlsafe
+            try:
+                pad = (-len(b64s)) % 4
+                b64s2 = b64s.replace("-", "+").replace("_", "/") + ("=" * pad if pad else "")
+                return base64.b64decode(b64s2)
+            except Exception:
+                return None
+
+    raw = _b64decode_any(s)
+    if not raw:
+        return None
+
+    # 4а) як DER-публічний ключ
+    try:
+        pk = serialization.load_der_public_key(raw)
+        pem = pk.public_bytes(
+            encoding=serialization.Encoding.PEM,
+            format=serialization.PublicFormat.SubjectPublicKeyInfo,
+        )
+        return pem
+    except Exception:
+        pass
+
+    # 4б) як DER-сертифікат
+    try:
+        cert = load_der_x509_certificate(raw)
+        pk = cert.public_key()
+        pem = pk.public_bytes(
+            encoding=serialization.Encoding.PEM,
+            format=serialization.PublicFormat.SubjectPublicKeyInfo,
+        )
+        return pem
+    except Exception:
+        pass
+
+    return None
+
+
 async def _fetch_mono_pubkey_pem() -> bytes:
+    """
+    Джерела в порядку пріоритету:
+      1) MONOPAY_PUBKEY або MONOPAY_PUBKEY_PEM з .env (будь-який формат, див. _try_parse_pubkey_from_text)
+      2) GET /api/merchant/pubkey (X-Token), з подальшим розбором як вище
+    На виході — PEM публічного ключа (bytes).
+    """
     global _MONO_PUBKEY_PEM
     if _MONO_PUBKEY_PEM:
         return _MONO_PUBKEY_PEM
 
+    # 1) .env
+    env_val = os.getenv("MONOPAY_PUBKEY") or os.getenv("MONOPAY_PUBKEY_PEM")
+    if env_val:
+        pem = _try_parse_pubkey_from_text(env_val)
+        if not pem:
+            raise RuntimeError("MONOPAY_PUBKEY env is set but can't be parsed")
+        _MONO_PUBKEY_PEM = pem
+        return _MONO_PUBKEY_PEM
+
+    # 2) API
     headers = {"X-Token": settings.MONOPAY_TOKEN}
     async with aiohttp.ClientSession() as s:
         async with s.get(f"{MONO_BASE}/api/merchant/pubkey", headers=headers, timeout=15) as r:
@@ -40,38 +134,15 @@ async def _fetch_mono_pubkey_pem() -> bytes:
             if r.status != 200:
                 raise RuntimeError(f"monobank pubkey error {r.status}: {txt}")
 
-    s_txt = txt.strip().strip('"')
-
-    # JSON?
-    try:
-        j = json.loads(s_txt)
-        s_txt = str(j.get("key") or j.get("pubkey") or j.get("data") or s_txt).strip()
-    except Exception:
-        pass
-
-    # Уже PEM?
-    if "BEGIN PUBLIC KEY" in s_txt:
-        _MONO_PUBKEY_PEM = s_txt.encode()
-        return _MONO_PUBKEY_PEM
-
-    # Иначе base64 (возможно urlsafe и без паддинга) -> DER -> PEM
-    def _b64(s: str) -> bytes:
-        try:
-            pad = (-len(s)) % 4
-            return base64.b64decode(s + ("=" * pad if pad else ""))
-        except Exception:
-            pad = (-len(s)) % 4
-            s2 = s.replace("-", "+").replace("_", "/") + ("=" * pad if pad else "")
-            return base64.b64decode(s2)
-
-    der = _b64(s_txt)
-    b64 = base64.encodebytes(der).replace(b"\n\n", b"\n")
-    pem = b"-----BEGIN PUBLIC KEY-----\n" + b64 + b"-----END PUBLIC KEY-----\n"
+    pem = _try_parse_pubkey_from_text(txt)
+    if not pem:
+        raise RuntimeError("monobank pubkey: can't parse format")
     _MONO_PUBKEY_PEM = pem
     return _MONO_PUBKEY_PEM
 
 
 def _load_mono_pubkey_obj() -> None:
+    """Ініціалізуємо cryptography-об’єкт публічного ключа з PEM і логнемо відбиток."""
     global _MONO_PUBKEY_OBJ
     if _MONO_PUBKEY_OBJ is not None:
         return
@@ -88,7 +159,7 @@ def _load_mono_pubkey_obj() -> None:
 
 
 def _reset_mono_pubkey_cache():
-    """Сброс кешей ключа Mono (без проблем со скоупом)."""
+    """Скинути кеші ключа Mono."""
     global _MONO_PUBKEY_PEM, _MONO_PUBKEY_OBJ
     _MONO_PUBKEY_PEM = None
     _MONO_PUBKEY_OBJ = None
@@ -107,7 +178,7 @@ def _decode_b64_maybe_urlsafe(s: str) -> bytes:
 
 def _verify_mono_xsign(body: bytes, x_sign_b64: str) -> bool:
     """
-    Проверка X-Sign: сначала DER, если нет — raw r||s (64 байта).
+    Валідація X-Sign: спочатку DER, якщо ні — raw r||s (64 байти).
     """
     if not _MONO_PUBKEY_OBJ:
         raise RuntimeError("mono pubkey obj not initialized")
@@ -141,7 +212,8 @@ def _verify_mono_xsign(body: bytes, x_sign_b64: str) -> bool:
     return False
 
 
-# --- CryptoPay: секретный путь вебхука
+# ===================== CryptoPay: секретний шлях вебхука =====================
+
 def _crypto_secret_path() -> str:
     if settings.CRYPTO_WEBHOOK_PATH and settings.CRYPTO_WEBHOOK_PATH != "/cryptobot":
         return settings.CRYPTO_WEBHOOK_PATH
@@ -149,7 +221,8 @@ def _crypto_secret_path() -> str:
     return f"/cryptobot/{slug}"
 
 
-# --- Надёжное подключение к БД с ретраями
+# ===================== Надійне підключення до БД з ретраями =====================
+
 async def _connect_db_with_retry(max_tries: int = 8) -> None:
     delay = 0.5
     last_err = None
@@ -180,6 +253,7 @@ async def on_startup(bot: Bot):
         BotCommand(command="help", description="Help"),
         BotCommand(command="admin", description="Admin panel"),
     ])
+    # Підвантажимо і проініціалізуємо ключ Mono
     if settings.MONOPAY_TOKEN:
         try:
             await _fetch_mono_pubkey_pem()
@@ -220,6 +294,7 @@ async def polling():
 # ===================== Webhook app =====================
 
 async def _verify_crypto_signature(req: web.Request, body: bytes) -> bool:
+    """Crypto Pay: HMAC_SHA256(body, key=SHA256(token)), header: crypto-pay-api-signature"""
     sig = req.headers.get("crypto-pay-api-signature", "")
     secret = hashlib.sha256((settings.CRYPTO_PAY_TOKEN or "").encode()).digest()
     calc = hmac.new(secret, body, hashlib.sha256).hexdigest()
@@ -248,15 +323,15 @@ async def _handle_cryptobot_webhook(request: web.Request):
 
 async def _handle_monopay_webhook(request: web.Request):
     """
-    Жёсткая проверка X-Sign (ECDSA, поддерживаем DER и RAW r||s; обычный и urlsafe base64).
-    На success — помечаем платёж и активируем пользователя.
+    X-Sign: перевіряємо DER і RAW r||s; підтримуємо звич./urlsafe base64.
+    На success — помічаємо платіж і активуємо користувача.
     """
     raw = await request.read()
     x_sign = request.headers.get("X-Sign") or request.headers.get("x-sign")
     if not x_sign:
         return web.Response(status=403, text="no signature")
 
-    # Проверяем подпись; при фейле один раз обновим ключ (возможна ротация)
+    # Перевірка підпису; при фейлі один раз оновимо ключ (можлива ротація)
     try:
         if _MONO_PUBKEY_PEM is None or _MONO_PUBKEY_OBJ is None:
             await _fetch_mono_pubkey_pem()
@@ -322,7 +397,7 @@ async def webhook():
     # Telegram webhook
     app.router.add_post(settings.WEBHOOK_PATH, handle_tg)
 
-    # CryptoPay webhook — секретный путь
+    # CryptoPay webhook — секретний шлях
     CRYPTO_PATH = _crypto_secret_path()
     app.router.add_post(CRYPTO_PATH, _handle_cryptobot_webhook)
     log.info("CryptoPay webhook path: %s", CRYPTO_PATH)
