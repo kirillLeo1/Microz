@@ -14,8 +14,7 @@ class Settings(BaseSettings):
     # === MonoPay
     MONOPAY_TOKEN: str = ""                 # X-Token мерчанта
     MONOPAY_WEBHOOK_PATH: str = "/monopay"  # путь вебхука
-    # Минимальный вывод в «монетах»/поинтах бота
-    MIN_WITHDRAW = int(os.getenv("MIN_WITHDRAW", "10000"))  # 10 000 ~= $50
+    # Минимальный вывод в «монетах»/поинтах бот
 
     # === CryptoBot
     CRYPTO_PAY_TOKEN: str = ""                 # токен из @CryptoBot
