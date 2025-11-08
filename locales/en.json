@@ -22,7 +22,7 @@
   "status_active": "Active",
   "status_inactive": "Inactive",
   "ref_link": "Your ref link:\nhttps://t.me/{bot}?start={tg_id}",
-  "withdraw_min": "Minimum to withdraw — 1000 QC ($5).",
+  "withdraw_min": "Minimum to withdraw — 10000 QC ($50).",
   "withdraw_start": "Withdraw request: enter your country (free text):",
   "withdraw_method": "Payout method: choose",
   "withdraw_crypto": "Crypto",
