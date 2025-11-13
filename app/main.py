@@ -7,7 +7,7 @@ from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
 
 from .config import settings
-from .db import connect, close, execute, fetchrow, fetchval
+from .db import connect, close, execute, fetchrow, fetchval, fetch
 from .schema import ensure_schema, run_stars_migration
 from .handlers import start, profile, tasks, withdraw, admin
 from aiocryptopay import AioCryptoPay, Networks  # лишаю для payments.py
