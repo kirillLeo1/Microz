@@ -21,6 +21,7 @@ from functools import lru_cache
 
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("main")
+ref_log = logging.getLogger("main.ref")
 
 MONO_BASE = "https://api.monobank.ua"
 
@@ -61,40 +62,41 @@ async def _detect_ref_column() -> str | None:
         else:
             _REF_COL_CACHE = None
 
+        ref_log.info("[ref] detected ref column: %s", _REF_COL_CACHE)
         return _REF_COL_CACHE
 
 
 
+
 async def _get_referrer_tg_id(invitee_tg_id: int) -> int | None:
-    """
-    Возвращаем TG-ID пригласившего для данного invitee.
-    Колонка может хранить tg_id или внутренний id — определяем автоматически.
-    """
     col = await _detect_ref_column()
     if not col:
+        ref_log.info("[ref] skip: no ref column for invitee %s", invitee_tg_id)
         return None
 
-    # безопасно, т.к. col из белого списка кандидатов
     row = await fetchrow(f"SELECT {col} AS ref_raw FROM users WHERE tg_id=$1", invitee_tg_id)
     if not row:
+        ref_log.info("[ref] skip: invitee %s not found in users", invitee_tg_id)
         return None
 
     ref_raw = row["ref_raw"]
     if not ref_raw or ref_raw == 0:
+        ref_log.info("[ref] skip: no referrer set for invitee %s", invitee_tg_id)
         return None
 
-    # вариант 1: сразу tg_id
+    # raw как tg_id?
     u = await fetchrow("SELECT tg_id FROM users WHERE tg_id=$1", ref_raw)
     if u:
         return int(ref_raw)
 
-    # вариант 2: это внутренний id
+    # raw как internal id?
     u = await fetchrow("SELECT tg_id FROM users WHERE id=$1", ref_raw)
-    if u:
+    if u and u["tg_id"]:
         return int(u["tg_id"])
 
-    # ничего не нашли — возможно кастомная схема
+    ref_log.info("[ref] skip: ref_raw %s for invitee %s not resolvable to tg_id", ref_raw, invitee_tg_id)
     return None
+
 
 
 
@@ -104,39 +106,31 @@ async def _get_user_id_by_tg(tg_id: int) -> int | None:
 
 
 async def award_ref_bonus_if_needed(invitee_tg_id: int) -> None:
-    """
-    Начисляем +settings.REF_BONUS_QC QC пригласившему.
-    Делаем это один раз на каждого invitee:
-      - проверяем маркер в payments (provider='ref_bonus', uuid='ref:<invitee_tg>')
-    """
     try:
-        # 1) есть ли пригласивший?
+        ref_log.info("[ref] try bonus for invitee %s", invitee_tg_id)
+
         ref_tg = await _get_referrer_tg_id(invitee_tg_id)
         if not ref_tg:
-            return  # пришёл без рефки — выходим
+            ref_log.info("[ref] stop: no referrer for invitee %s", invitee_tg_id)
+            return
 
-        # 2) уже платили за этого инвайти?
         marker = f"ref:{invitee_tg_id}"
         paid = await fetchval(
             "SELECT 1 FROM payments WHERE provider='ref_bonus' AND uuid=$1",
             marker
         )
         if paid:
-            return  # бонус уже начисляли
+            ref_log.info("[ref] stop: marker exists for invitee %s", invitee_tg_id)
+            return
 
-        # 3) найдём user_id пригласившего (для записи в payments)
-        ref_user_id = await _get_user_id_by_tg(ref_tg)
+        ref_user = await fetchrow("SELECT id FROM users WHERE tg_id=$1", ref_tg)
+        ref_user_id = ref_user["id"] if ref_user else None
 
-        # 4) начислим баланс пригласившему
         await execute(
             "UPDATE users SET balance_qc = COALESCE(balance_qc,0) + $1 WHERE tg_id = $2",
-            settings.REF_BONUS_QC,
-            ref_tg,
+            settings.REF_BONUS_QC, ref_tg
         )
 
-        # 5) поставим маркер, чтобы второй раз не начислить
-        #    Записываем в payments как «виртуальный платёж» провайдера ref_bonus
-        #    user_id — пригласивший (если нашли), status='paid'
         try:
             await execute(
                 "INSERT INTO payments (provider, uuid, status, user_id, amount) "
@@ -144,16 +138,16 @@ async def award_ref_bonus_if_needed(invitee_tg_id: int) -> None:
                 marker, ref_user_id, settings.REF_BONUS_QC
             )
         except Exception:
-            # если где-то отличаются колонки — пишем минимальный вариант без amount/user_id
             await execute(
                 "INSERT INTO payments (provider, uuid, status) VALUES ('ref_bonus', $1, 'paid')",
                 marker
             )
 
-        log.info("Ref bonus +%s QC for inviter %s (invitee %s)",
-                 settings.REF_BONUS_QC, ref_tg, invitee_tg_id)
+        ref_log.info("[ref] OK +%s QC to inviter %s (invitee %s)",
+                     settings.REF_BONUS_QC, ref_tg, invitee_tg_id)
+
     except Exception as e:
-        log.warning("Ref bonus failed for invitee %s: %r", invitee_tg_id, e)
+        ref_log.warning("[ref] FAIL for invitee %s: %r", invitee_tg_id, e)
 
 # ===================== Mono: робота з публічним ключем =====================
 
@@ -540,16 +534,16 @@ async def _handle_monopay_webhook(request: web.Request):
         """, str(invoice_id), str(reference), str(reference))
 
         if row:
-    # 3) активировать доступ
+            u = await fetchrow("SELECT id, tg_id, referrer_id FROM users WHERE id=$1", row["user_id"])
+            ref_log.info("[ref] invitee candidate (mono): user_id=%s tg_id=%s ref_id=%s",
+                         row["user_id"], u["tg_id"] if u else None, u["referrer_id"] if u else None)
+
+            # активируем доступ
             await execute("UPDATE users SET status='active' WHERE id=$1", row["user_id"])
 
-    # 4) вытащить tg_id и начислить бонус рефералу
-            u = await fetchrow("SELECT tg_id FROM users WHERE id=$1", row["user_id"])
+            # начисляем бонус
             if u and u["tg_id"]:
-                 await award_ref_bonus_if_needed(u["tg_id"])
-
-        log.info("Mono success: invoice=%s ref=%s", invoice_id, reference)
-        return web.Response(text="ok")
+                await award_ref_bonus_if_needed(u["tg_id"])
 
 
 
