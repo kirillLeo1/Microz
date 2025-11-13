@@ -7,7 +7,7 @@ from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
 
 from .config import settings
-from .db import connect, close, execute, fetchrow
+from .db import connect, close, execute, fetchrow, fetchval
 from .schema import ensure_schema, run_stars_migration
 from .handlers import start, profile, tasks, withdraw, admin
 from aiocryptopay import AioCryptoPay, Networks  # лишаю для payments.py
@@ -27,6 +27,84 @@ MONO_BASE = "https://api.monobank.ua"
 _MONO_PUBKEY_PEM: bytes | None = None
 _MONO_PUBKEY_OBJ = None  # ec.EllipticCurvePublicKey
 
+
+async def _get_referrer_tg_id(invitee_tg_id: int) -> int | None:
+    """
+    Достаём пригласившего по колонке, как она у тебя называется.
+    Пробуем несколько популярных имён: invited_by / referrer_id / ref / inviter.
+    Возвращаем TG-ID реферала (не внутренний id).
+    """
+    row = await fetchrow("""
+        SELECT
+          COALESCE(NULLIF(invited_by, 0),
+                   NULLIF(referrer_id, 0),
+                   NULLIF(ref, 0),
+                   NULLIF(inviter, 0)) AS ref_tg
+        FROM users
+        WHERE tg_id = $1
+        LIMIT 1
+    """, invitee_tg_id)
+    if not row:
+        return None
+    return row.get("ref_tg")
+
+
+async def _get_user_id_by_tg(tg_id: int) -> int | None:
+    row = await fetchrow("SELECT id FROM users WHERE tg_id = $1", tg_id)
+    return row["id"] if row else None
+
+
+async def award_ref_bonus_if_needed(invitee_tg_id: int) -> None:
+    """
+    Начисляем +settings.REF_BONUS_QC QC пригласившему.
+    Делаем это один раз на каждого invitee:
+      - проверяем маркер в payments (provider='ref_bonus', uuid='ref:<invitee_tg>')
+    """
+    try:
+        # 1) есть ли пригласивший?
+        ref_tg = await _get_referrer_tg_id(invitee_tg_id)
+        if not ref_tg:
+            return  # пришёл без рефки — выходим
+
+        # 2) уже платили за этого инвайти?
+        marker = f"ref:{invitee_tg_id}"
+        paid = await fetchval(
+            "SELECT 1 FROM payments WHERE provider='ref_bonus' AND uuid=$1",
+            marker
+        )
+        if paid:
+            return  # бонус уже начисляли
+
+        # 3) найдём user_id пригласившего (для записи в payments)
+        ref_user_id = await _get_user_id_by_tg(ref_tg)
+
+        # 4) начислим баланс пригласившему
+        await execute(
+            "UPDATE users SET balance_qc = COALESCE(balance_qc,0) + $1 WHERE tg_id = $2",
+            settings.REF_BONUS_QC,
+            ref_tg,
+        )
+
+        # 5) поставим маркер, чтобы второй раз не начислить
+        #    Записываем в payments как «виртуальный платёж» провайдера ref_bonus
+        #    user_id — пригласивший (если нашли), status='paid'
+        try:
+            await execute(
+                "INSERT INTO payments (provider, uuid, status, user_id, amount) "
+                "VALUES ('ref_bonus', $1, 'paid', $2, $3)",
+                marker, ref_user_id, settings.REF_BONUS_QC
+            )
+        except Exception:
+            # если где-то отличаются колонки — пишем минимальный вариант без amount/user_id
+            await execute(
+                "INSERT INTO payments (provider, uuid, status) VALUES ('ref_bonus', $1, 'paid')",
+                marker
+            )
+
+        log.info("Ref bonus +%s QC for inviter %s (invitee %s)",
+                 settings.REF_BONUS_QC, ref_tg, invitee_tg_id)
+    except Exception as e:
+        log.warning("Ref bonus failed for invitee %s: %r", invitee_tg_id, e)
 
 # ===================== Mono: робота з публічним ключем =====================
 
@@ -336,13 +414,30 @@ async def _handle_cryptobot_webhook(request: web.Request):
         payload = data.get("payload") or {}
         inv = str(payload.get("invoice_id"))
 
-        await execute("UPDATE payments SET status='paid' WHERE provider='cryptobot' AND uuid=$1", inv)
-        row = await fetchrow("SELECT user_id FROM payments WHERE provider='cryptobot' AND uuid=$1", inv)
+    # 1) отметить платёж
+        await execute(
+            "UPDATE payments SET status='paid' WHERE provider='cryptobot' AND uuid=$1",
+            inv
+        )
+
+    # 2) найти платеж и юзера
+        row = await fetchrow(
+            "SELECT user_id FROM payments WHERE provider='cryptobot' AND uuid=$1",
+            inv
+        )
         if row:
+        # 3) активировать доступ
             await execute("UPDATE users SET status='active' WHERE id=$1", row["user_id"])
+
+        # 4) tg_id -> реф-бонус
+            u = await fetchrow("SELECT tg_id FROM users WHERE id=$1", row["user_id"])
+            if u and u["tg_id"]:
+                await award_ref_bonus_if_needed(u["tg_id"])
+
         log.info("CryptoBot invoice_paid: %s", inv)
 
     return web.json_response({"ok": True})
+
 
 
 async def _handle_monopay_webhook(request: web.Request):
@@ -381,22 +476,32 @@ async def _handle_monopay_webhook(request: web.Request):
     invoice_id = data.get("invoiceId") or data.get("invoice_id")
 
     if status == "success":
+# 1) отметить платёж оплаченным
         await execute("""
             UPDATE payments SET status='paid'
             WHERE provider='monopay' AND (uuid=$1 OR uuid=$2 OR order_id=$3)
         """, str(invoice_id), str(reference), str(reference))
 
+# 2) найти пользователя из этого платежа
         row = await fetchrow("""
-            SELECT user_id FROM payments
+            SELECT user_id
+            FROM payments
             WHERE provider='monopay' AND (uuid=$1 OR uuid=$2 OR order_id=$3)
             ORDER BY id DESC LIMIT 1
         """, str(invoice_id), str(reference), str(reference))
+
         if row:
+    # 3) активировать доступ
             await execute("UPDATE users SET status='active' WHERE id=$1", row["user_id"])
 
-        log.info("Mono success: invoice=%s ref=%s", invoice_id, reference)
+    # 4) вытащить tg_id и начислить бонус рефералу
+            u = await fetchrow("SELECT tg_id FROM users WHERE id=$1", row["user_id"])
+            if u and u["tg_id"]:
+                 await award_ref_bonus_if_needed(u["tg_id"])
 
-    return web.Response(text="ok")
+        log.info("Mono success: invoice=%s ref=%s", invoice_id, reference)
+        return web.Response(text="ok")
+
 
 
 async def webhook():
