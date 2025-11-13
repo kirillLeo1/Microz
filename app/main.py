@@ -17,6 +17,7 @@ from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import ec, utils
 from cryptography.x509 import load_pem_x509_certificate, load_der_x509_certificate
 from cryptography.exceptions import InvalidSignature
+from functools import lru_cache
 
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("main")
@@ -27,26 +28,59 @@ MONO_BASE = "https://api.monobank.ua"
 _MONO_PUBKEY_PEM: bytes | None = None
 _MONO_PUBKEY_OBJ = None  # ec.EllipticCurvePublicKey
 
+@lru_cache()
+async def _detect_ref_column() -> str | None:
+    """
+    Смотрим, какие колонки есть в users, и выбираем первую подходящую.
+    Поддерживаем типичные варианты имён.
+    """
+    rows = await fetch("""
+        SELECT column_name
+        FROM information_schema.columns
+        WHERE table_schema='public' AND table_name='users'
+    """)
+    cols = {r["column_name"] for r in rows}
+    candidates = [
+        "invited_by", "referrer_id", "ref", "inviter",
+        "ref_tg", "referrer_tg", "parent_id", "parent_tg",
+    ]
+    for c in candidates:
+        if c in cols:
+            return c
+    return None
+
 
 async def _get_referrer_tg_id(invitee_tg_id: int) -> int | None:
     """
-    Достаём пригласившего по колонке, как она у тебя называется.
-    Пробуем несколько популярных имён: invited_by / referrer_id / ref / inviter.
-    Возвращаем TG-ID реферала (не внутренний id).
+    Возвращаем TG-ID пригласившего для данного invitee.
+    Колонка может хранить tg_id или внутренний id — определяем автоматически.
     """
-    row = await fetchrow("""
-        SELECT
-          COALESCE(NULLIF(invited_by, 0),
-                   NULLIF(referrer_id, 0),
-                   NULLIF(ref, 0),
-                   NULLIF(inviter, 0)) AS ref_tg
-        FROM users
-        WHERE tg_id = $1
-        LIMIT 1
-    """, invitee_tg_id)
+    col = await _detect_ref_column()
+    if not col:
+        return None
+
+    # безопасно, т.к. col из белого списка кандидатов
+    row = await fetchrow(f"SELECT {col} AS ref_raw FROM users WHERE tg_id=$1", invitee_tg_id)
     if not row:
         return None
-    return row.get("ref_tg")
+
+    ref_raw = row["ref_raw"]
+    if not ref_raw or ref_raw == 0:
+        return None
+
+    # вариант 1: сразу tg_id
+    u = await fetchrow("SELECT tg_id FROM users WHERE tg_id=$1", ref_raw)
+    if u:
+        return int(ref_raw)
+
+    # вариант 2: это внутренний id
+    u = await fetchrow("SELECT tg_id FROM users WHERE id=$1", ref_raw)
+    if u:
+        return int(u["tg_id"])
+
+    # ничего не нашли — возможно кастомная схема
+    return None
+
 
 
 async def _get_user_id_by_tg(tg_id: int) -> int | None:
