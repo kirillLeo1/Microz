@@ -24,7 +24,7 @@ class Settings(BaseSettings):
     WEBHOOK_URL: str | None = None
     WEBHOOK_PATH: str = "/webhook"
     TZ_KYIV: str = "Europe/Kyiv"
-    REF_BONUS_QC = int(os.getenv("REF_BONUS_QC", "120"))
+    REF_BONUS_QC: int = 120
 
 
     class Config:
