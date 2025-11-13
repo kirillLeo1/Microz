@@ -28,26 +28,41 @@ MONO_BASE = "https://api.monobank.ua"
 _MONO_PUBKEY_PEM: bytes | None = None
 _MONO_PUBKEY_OBJ = None  # ec.EllipticCurvePublicKey
 
-@lru_cache()
+_REF_COL_CACHE = None          # type: str | None
+_REF_COL_LOCK = asyncio.Lock()
+
 async def _detect_ref_column() -> str | None:
     """
-    Смотрим, какие колонки есть в users, и выбираем первую подходящую.
-    Поддерживаем типичные варианты имён.
+    Определяем, в какой колонке таблицы users хранится реферал.
+    Кэшируем строковое имя колонки, а не корутину.
     """
-    rows = await fetch("""
-        SELECT column_name
-        FROM information_schema.columns
-        WHERE table_schema='public' AND table_name='users'
-    """)
-    cols = {r["column_name"] for r in rows}
-    candidates = [
-        "invited_by", "referrer_id", "ref", "inviter",
-        "ref_tg", "referrer_tg", "parent_id", "parent_tg",
-    ]
-    for c in candidates:
-        if c in cols:
-            return c
-    return None
+    global _REF_COL_CACHE
+    if _REF_COL_CACHE is not None:
+        return _REF_COL_CACHE
+
+    async with _REF_COL_LOCK:
+        if _REF_COL_CACHE is not None:
+            return _REF_COL_CACHE
+
+        rows = await fetch("""
+            SELECT column_name
+            FROM information_schema.columns
+            WHERE table_schema='public' AND table_name='users'
+        """)
+        cols = {r["column_name"] for r in rows}
+        candidates = [
+            "referrer_id", "invited_by", "ref", "inviter",
+            "ref_tg", "referrer_tg", "parent_id", "parent_tg",
+        ]
+        for c in candidates:
+            if c in cols:
+                _REF_COL_CACHE = c
+                break
+        else:
+            _REF_COL_CACHE = None
+
+        return _REF_COL_CACHE
+
 
 
 async def _get_referrer_tg_id(invitee_tg_id: int) -> int | None:
